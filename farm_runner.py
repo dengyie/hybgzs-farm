@@ -701,6 +701,11 @@ class FarmClient:
         ok, payload, err = unwrap_api(res)
         data = payload.get("data") if isinstance(payload, dict) else payload
         self._status_cache = None
+        if ok:
+            n = int((data or {}).get("plantedCount") or 0) if isinstance(data, dict) else 0
+            log.info("action.plant ok plantedCount=%s purchased=%s", n, (data or {}).get("purchasedCount") if isinstance(data, dict) else None)
+        else:
+            log.error("action.plant FAIL seed=%s qty=%s err=%s payload=%s", seed_id, quantity, err, clip(payload, 200))
         return {"success": ok, "payload": payload, "error": err, "data": data}
 
     async def plant_smart(
@@ -787,21 +792,52 @@ class FarmClient:
 
         # 无写操作则复用 before，少打 1 轮 API
         mid = await self.get_farm_status() if did_write else before
+        harvested_n = 0
         if mid["mature_count"] > 0:
             if dry_run:
                 log.info("pipeline.harvest dry-run mature=%s", mid["mature_count"])
                 report["harvest"] = {"dry_run": True, "mature": mid["mature_count"]}
+                harvested_n = mid["mature_count"]
             else:
                 report["harvest"] = await self.harvest_all(destroy_if_full=destroy_if_full)
                 did_write = True
-                await asyncio.sleep(0.5)
+                hdata = (report["harvest"] or {}).get("data") or {}
+                if isinstance(hdata, dict):
+                    harvested_n = int(
+                        hdata.get("harvestedCount")
+                        or len(hdata.get("harvestedCropIds") or [])
+                        or 0
+                    )
+                # 收菜后服务端状态可能滞后：轮询直到出现空位或超时
+                await asyncio.sleep(0.8)
         else:
             log.info("pipeline.harvest skip")
 
         after_h = await self.get_farm_status() if did_write else mid
         empty_for_plant = after_h["empty_slots"]
-        if dry_run and mid["mature_count"] > 0:
-            empty_for_plant = after_h["empty_slots"] + mid["mature_count"]
+
+        # 关键：收成功但 empty 仍为 0 → 重拉最多 5 次；仍 0 则用 harvested_n 估算空位强种
+        if not dry_run and harvested_n > 0 and empty_for_plant <= 0:
+            log.warning(
+                "pipeline.plant empty_lag harvested=%s empty=%s — retry status",
+                harvested_n,
+                empty_for_plant,
+            )
+            for i in range(5):
+                await asyncio.sleep(0.7)
+                after_h = await self.get_farm_status()
+                empty_for_plant = after_h["empty_slots"]
+                log.info("pipeline.plant lag_poll=%s empty=%s planted=%s", i, empty_for_plant, after_h["planted_count"])
+                if empty_for_plant > 0:
+                    break
+            if empty_for_plant <= 0:
+                # API 已收但 crops 仍满：按收获数强制补种名额（plant-batch 只填空地）
+                guess = min(harvested_n, after_h.get("max_slots") or harvested_n)
+                log.warning("pipeline.plant force_empty_override=%s (status lag)", guess)
+                empty_for_plant = guess
+
+        if dry_run and (mid["mature_count"] > 0 or harvested_n > 0):
+            empty_for_plant = after_h["empty_slots"] + (harvested_n or mid["mature_count"])
             log.info("pipeline.plant dry-run assume_empty=%s", empty_for_plant)
 
         if empty_for_plant > 0:
@@ -810,12 +846,38 @@ class FarmClient:
                 prefer_seed=prefer_seed,
                 dry_run=dry_run,
                 status=after_h,
-                empty_override=empty_for_plant if dry_run else None,
+                empty_override=empty_for_plant,
             )
             if not dry_run and report["plant"].get("planted"):
                 did_write = True
+            # 种完再确认：若仍有空位且有库存，再补一轮
+            if not dry_run:
+                after_p = await self.get_farm_status()
+                if after_p["empty_slots"] > 0:
+                    stock = sum((after_p.get("inventory_qty") or {}).values())
+                    if stock > 0 or allow_buy:
+                        log.warning(
+                            "pipeline.plant second_pass empty=%s stock=%s",
+                            after_p["empty_slots"],
+                            stock,
+                        )
+                        r2 = await self.plant_smart(
+                            allow_buy=allow_buy,
+                            prefer_seed=prefer_seed,
+                            dry_run=False,
+                            status=after_p,
+                        )
+                        report["plant_second"] = r2
+                        if r2.get("planted"):
+                            did_write = True
+                            prev = int((report.get("plant") or {}).get("planted") or 0)
+                            if isinstance(report.get("plant"), dict):
+                                report["plant"]["planted"] = prev + int(r2.get("planted") or 0)
+                    else:
+                        log.warning("pipeline.plant still_empty no_stock — need --allow-buy or buy seeds")
+                after_h = after_p
         else:
-            log.info("pipeline.plant skip")
+            log.info("pipeline.plant skip empty=0 harvested_n=%s", harvested_n)
             report["plant"] = {"success": True, "planted": 0, "reason": "no_empty"}
 
         after = await self.get_farm_status() if did_write else after_h
