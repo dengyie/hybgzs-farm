@@ -1,41 +1,47 @@
 # hybgzs-farm
 
-黑与白福利站（`cdk.hybgzs.com/entertainment/farm`）轻松农场自动化脚本。
+黑与白福利站轻松农场自动化：`https://cdk.hybgzs.com/entertainment/farm`
 
-## 功能
+## 能力
 
-- **自动发现 CDP**：复用已登录 Chrome（无头/有头），不重启、不杀进程、不硬写死 9222。
-- **一键务农 (care)**：自动处理 浇水/除草/杀虫 去除 debuff。
-- **一键收菜 (harvest)**：先务农后收获（`destroyIfFull=false` 保护仓库）。
-- **智能种菜 (plant)**：识别空地，优先使用背包库存种子填充，防自动扣币。
-- **命令行操作**：支持 `status`, `run`, `care`, `harvest`, `plant` 模式。
+- 自动发现 headed CDP（9222/9223…），复用登录态，不杀 Chrome
+- **智能流水线** `run`：务农 → 收菜 → 复检 → 按价值补种
+- 选种：`harvestValue/growthTime` 单位时间价值，**库存优先**，可选 `--allow-buy`
+- `status`：余额/体力/待收/灾害/空位/仓库/下次成熟 ETA/动作建议
+- 默认不毁仓、不扣币买种
 
-## 安全与红线
-
-1. **绝对禁杀 Chrome**：遇 CF 人机在 Chrome 前台手动过验证，脚本等待不崩溃。
-2. **零扣币安全**：默认仅种植库存种子，购买新种子须显式声明参数。
-3. **零毁菜安全**：仓库爆满时拒绝强制摧毁收获，保障资产。
-
-## 使用方法
+## 命令
 
 ```bash
 cd /Users/mango/project/hermes/hybgzs-farm
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 查看农场状态
 python3 farm_runner.py status
-
-# 执行完整流水线（务农 -> 收菜 -> 补种库存种子）
 python3 farm_runner.py run
-
-# 仅务农
+python3 farm_runner.py run --dry-run
 python3 farm_runner.py care
-
-# 仅收菜
 python3 farm_runner.py harvest
-
-# 仅补种（只用库存）
 python3 farm_runner.py plant
+python3 farm_runner.py plant --seed carrot
+python3 farm_runner.py plant --allow-buy   # 明确允许扣币
+python3 farm_runner.py run --json
+```
+
+## 红线
+
+1. 不 launch / 不杀 Chrome  
+2. `destroyIfFull` 默认 false  
+3. 购种默认关闭（`--allow-buy`）  
+4. CF/人机：headed 等待，不假装成功  
+
+## VPS
+
+Clone 本仓，在 VPS 上对接带登录 Cookie 的 headed/CDP Chrome 即可：
+
+```bash
+git clone https://github.com/dengyie/hybgzs-farm.git
+cd hybgzs-farm && python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python3 farm_runner.py run
 ```
