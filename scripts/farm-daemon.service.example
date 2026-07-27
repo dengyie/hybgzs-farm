@@ -1,0 +1,28 @@
+# systemd 用户服务示例（VPS）
+# 1. 先保证 Chrome/Chromium 带 --remote-debugging-port=9222 且已登录农场
+# 2. 复制到 ~/.config/systemd/user/hybgzs-farm.service
+# 3. systemctl --user daemon-reload && systemctl --user enable --now hybgzs-farm
+
+[Unit]
+Description=hybgzs farm idle daemon
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hybgzs-farm
+Environment=FARM_CDP=http://127.0.0.1:9222
+Environment=FARM_LOG_LEVEL=INFO
+Environment=FARM_MIN_SLEEP=60
+Environment=FARM_MAX_SLEEP=1800
+Environment=FARM_LEAD=45
+Environment=FARM_CARE_EVERY=600
+ExecStart=/opt/hybgzs-farm/.venv/bin/python /opt/hybgzs-farm/farm_runner.py daemon
+Restart=on-failure
+RestartSec=30
+# 控资源
+Nice=10
+CPUQuota=20%
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target

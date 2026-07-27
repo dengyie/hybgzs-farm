@@ -3,10 +3,11 @@
 hybgzs 轻松农场自动化 (cdk.hybgzs.com/entertainment/farm)
 
 设计:
-- 一次性 CLI（默认不常驻）→ 跑完断开 CDP，控 CPU/内存
+- 默认一次性 CLI；`daemon` 模式 VPS/本机挂机监控
 - 复用 headed 已登录 Chrome；自动发现 CDP；不 launch / 不杀 Chrome
 - 页面内 fetch 带 Cookie；写操作 DOM 优先 + API 校验
 - 智能: care→harvest→recheck→plant；种子按价值/时长评分，库存优先
+- 挂机: 按 next_mature + 灾害巡检间隔休眠；每轮连 CDP→干活→断开，控资源
 
 红线:
 1. 不杀 Chrome
@@ -103,6 +104,24 @@ class SingleInstance:
 
 
 def discover_cdp(ports: Optional[list[int]] = None) -> tuple[Optional[str], Optional[str], Optional[int]]:
+    # FARM_CDP / COINBOT_CDP 可指定，如 http://127.0.0.1:9223
+    env = (os.environ.get("FARM_CDP") or os.environ.get("COINBOT_CDP") or "").strip().rstrip("/")
+    if env.startswith("http"):
+        try:
+            op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with op.open(env + "/json/version", timeout=2.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                ws = data.get("webSocketDebuggerUrl")
+                if ws:
+                    # port parse
+                    port = None
+                    try:
+                        port = int(env.rsplit(":", 1)[-1])
+                    except Exception:
+                        port = None
+                    return env, ws, port
+        except Exception as e:
+            log.warning("cdp.env_fail url=%s err=%s — fallback scan", env, e)
     ports = ports or [9222, 9223, 9226, 9333, 9229]
     for p in ports:
         try:
@@ -887,7 +906,179 @@ class FarmClient:
         log.info("cdp.disconnected stats=%s", self.resource_snapshot())
 
 
+
+def compute_sleep_sec(
+    st: dict,
+    *,
+    min_s: float,
+    max_s: float,
+    lead_s: float,
+    care_every_s: float,
+    force_s: Optional[float] = None,
+) -> float:
+    """挂机休眠：成熟前提前 lead 醒来；生长中不超过 care_every 以便扫灾害。"""
+    if force_s is not None:
+        return max(min_s, min(max_s, float(force_s)))
+    # 有活立刻短歇再扫（防 API 刚写完状态滞后）
+    if st.get("mature_count", 0) > 0 or st.get("debuff_count", 0) > 0 or st.get("empty_slots", 0) > 0:
+        return max(min_s, min(30.0, max_s))
+    nm = st.get("next_mature_sec")
+    if nm is None:
+        # 全空且无 ETA：可能未种上或异常，别睡太久
+        return max(min_s, min(care_every_s, max_s))
+    # 距成熟 lead 秒前醒来
+    until_harvest = max(0.0, float(nm) - float(lead_s))
+    # 生长期间定期 care 巡检
+    wait = min(until_harvest, float(care_every_s))
+    return max(min_s, min(max_s, wait))
+
+
+def append_journal(path: Path, row: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = dict(row)
+    row.setdefault("ts", datetime.now(timezone.utc).isoformat())
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+
+
+async def run_daemon(args) -> int:
+    """
+    囤囤鼠式挂机：
+    循环 connect → status/pipeline → disconnect → sleep(ETA)
+    不常驻占着 CDP 事件流；每轮短连接，VPS 友好。
+    """
+    min_s = float(getattr(args, "min_sleep", 60))
+    max_s = float(getattr(args, "max_sleep", 1800))
+    lead_s = float(getattr(args, "lead", 45))
+    care_every_s = float(getattr(args, "care_every", 600))
+    max_cycles = int(getattr(args, "max_cycles", 0)) or 0
+    journal = Path(getattr(args, "journal", "") or (DEFAULT_LOG_DIR / "daemon-journal.jsonl"))
+    stop = asyncio.Event()
+
+    def _stop(signum, frame):
+        log.warning("daemon.signal %s — graceful stop", signum)
+        stop.set()
+
+    import signal as signal_mod
+    for sig in (signal_mod.SIGINT, signal_mod.SIGTERM):
+        try:
+            signal_mod.signal(sig, _stop)
+        except Exception:
+            pass
+
+    cycle = 0
+    consecutive_fail = 0
+    log.info(
+        "daemon.start min_sleep=%s max_sleep=%s lead=%s care_every=%s journal=%s",
+        min_s, max_s, lead_s, care_every_s, journal,
+    )
+    append_journal(journal, {"event": "daemon_start", "pid": os.getpid(), "min_s": min_s, "max_s": max_s})
+
+    while not stop.is_set():
+        cycle += 1
+        if max_cycles and cycle > max_cycles:
+            log.info("daemon.max_cycles reached %s", max_cycles)
+            break
+        cycle_t0 = time.monotonic()
+        http, ws, port = discover_cdp()
+        if not ws:
+            consecutive_fail += 1
+            backoff = min(max_s, min_s * min(consecutive_fail, 8))
+            log.error("daemon.cdp_missing fail=%s sleep=%.0fs", consecutive_fail, backoff)
+            append_journal(journal, {"event": "cdp_missing", "cycle": cycle, "sleep": backoff})
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=backoff)
+            except asyncio.TimeoutError:
+                pass
+            continue
+
+        client = FarmClient(ws, http or f"http://127.0.0.1:{port}")
+        sleep_s = care_every_s
+        report = None
+        try:
+            await client.connect()
+            # 有活干或巡检：跑流水线（内部会 status）
+            report = await client.run_pipeline(
+                destroy_if_full=args.destroy_if_full,
+                allow_buy=args.allow_buy,
+                prefer_seed=args.seed,
+                dry_run=args.dry_run,
+            )
+            after = report.get("after") or {}
+            # 构造最小 st 给 sleep
+            st_sleep = {
+                "mature_count": after.get("mature", 0),
+                "debuff_count": after.get("debuff", 0),
+                "empty_slots": after.get("empty", 0),
+                "next_mature_sec": after.get("next_mature_sec"),
+            }
+            sleep_s = compute_sleep_sec(
+                st_sleep, min_s=min_s, max_s=max_s, lead_s=lead_s, care_every_s=care_every_s
+            )
+            consecutive_fail = 0
+            append_journal(
+                journal,
+                {
+                    "event": "cycle_ok",
+                    "cycle": cycle,
+                    "port": port,
+                    "before": report.get("before"),
+                    "after": after,
+                    "care": bool(report.get("care")),
+                    "harvest": bool(report.get("harvest")),
+                    "plant": (report.get("plant") or {}).get("planted"),
+                    "sleep_s": sleep_s,
+                    "resource": report.get("resource"),
+                    "elapsed_s": round(time.monotonic() - cycle_t0, 2),
+                },
+            )
+            log.info(
+                "daemon.cycle=%s ok sleep=%.0fs next_mature=%s mature=%s debuff=%s empty=%s",
+                cycle,
+                sleep_s,
+                after.get("next_mature_sec"),
+                after.get("mature"),
+                after.get("debuff"),
+                after.get("empty"),
+            )
+        except Exception as e:
+            consecutive_fail += 1
+            sleep_s = min(max_s, min_s * min(consecutive_fail, 6))
+            log.exception("daemon.cycle_fail cycle=%s err=%s sleep=%.0fs", cycle, e, sleep_s)
+            append_journal(
+                journal,
+                {
+                    "event": "cycle_fail",
+                    "cycle": cycle,
+                    "error": str(e),
+                    "sleep_s": sleep_s,
+                    "fail": consecutive_fail,
+                },
+            )
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+        if stop.is_set():
+            break
+        # 可中断睡眠
+        log.info("daemon.sleep %.0fs (ctrl+c 结束)", sleep_s)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=sleep_s)
+        except asyncio.TimeoutError:
+            pass
+
+    append_journal(journal, {"event": "daemon_stop", "pid": os.getpid(), "cycles": cycle})
+    log.info("daemon.exit cycles=%s", cycle)
+    return 0
+
+
 async def main_async(args) -> int:
+    if args.mode == "daemon":
+        return await run_daemon(args)
+
     http, ws, port = discover_cdp()
     if not ws:
         log.error("cdp.not_found — 启动带 --remote-debugging-port 的 headed Chrome")
@@ -962,7 +1153,7 @@ async def main_async(args) -> int:
 
 def main():
     p = argparse.ArgumentParser(description="hybgzs 轻松农场智能自动化")
-    p.add_argument("mode", nargs="?", default="status", choices=["status", "run", "care", "harvest", "plant"])
+    p.add_argument("mode", nargs="?", default="status", choices=["status", "run", "care", "harvest", "plant", "daemon"])
     p.add_argument("--destroy-if-full", action="store_true")
     p.add_argument("--allow-buy", action="store_true")
     p.add_argument("--seed", default=None)
@@ -971,10 +1162,26 @@ def main():
     p.add_argument("--log-level", default=os.environ.get("FARM_LOG_LEVEL", "INFO"))
     p.add_argument("--log-file", default=os.environ.get("FARM_LOG_FILE"))
     p.add_argument("--no-lock", action="store_true", help="允许并发（不推荐）")
+    # daemon 挂机
+    p.add_argument("--min-sleep", type=float, default=float(os.environ.get("FARM_MIN_SLEEP", "60")),
+                   help="挂机最短休眠秒（默认60）")
+    p.add_argument("--max-sleep", type=float, default=float(os.environ.get("FARM_MAX_SLEEP", "1800")),
+                   help="挂机最长休眠秒（默认1800=30m）")
+    p.add_argument("--lead", type=float, default=float(os.environ.get("FARM_LEAD", "45")),
+                   help="成熟前提前醒来秒（默认45）")
+    p.add_argument("--care-every", type=float, default=float(os.environ.get("FARM_CARE_EVERY", "600")),
+                   help="无成熟时灾害巡检间隔秒（默认600）")
+    p.add_argument("--max-cycles", type=int, default=int(os.environ.get("FARM_MAX_CYCLES", "0")),
+                   help="挂机最多轮数，0=无限")
+    p.add_argument("--journal", default=os.environ.get("FARM_JOURNAL", ""),
+                   help="daemon JSONL 日志路径")
     args = p.parse_args()
 
     log_path = setup_logging(args.log_level, args.log_file, json_mode=args.json)
     log.info("boot mode=%s pid=%s log=%s", args.mode, os.getpid(), log_path)
+    if args.mode == "daemon":
+        log.info("daemon.config min=%s max=%s lead=%s care_every=%s",
+                 args.min_sleep, args.max_sleep, args.lead, args.care_every)
 
     lock = SingleInstance(DEFAULT_LOCK)
     if not args.no_lock:
