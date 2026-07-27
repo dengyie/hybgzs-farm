@@ -157,24 +157,52 @@ class FarmClient:
         res_wallet = await self.fetch_api("/api/wallet/balance")
         res_inv = await self.fetch_api("/api/farm/inventory")
 
-        crops_data = res_crops.get("data", {}) if res_crops and res_crops.get("ok") else {}
-        energy_data = res_energy.get("data", {}).get("data", {}) if res_energy and res_energy.get("ok") else {}
-        wallet_data = res_wallet.get("data", {}).get("data", {}) if res_wallet and res_wallet.get("ok") else {}
-        inv_data = res_inv.get("data", {}) if res_inv and res_inv.get("ok") else {}
+        crops_res_data = res_crops.get("data", {}) if res_crops and res_crops.get("ok") else {}
+        if isinstance(crops_res_data, dict) and "data" in crops_res_data:
+            crops_data = crops_res_data.get("data")
+        else:
+            crops_data = crops_res_data
 
-        crops = crops_data.get("crops") or crops_data.get("data") or []
-        max_slots = crops_data.get("maxSlots", 10)
-        
+        energy_res_data = res_energy.get("data", {}) if res_energy and res_energy.get("ok") else {}
+        energy_data = energy_res_data.get("data", {}) if isinstance(energy_res_data, dict) else {}
+
+        wallet_res_data = res_wallet.get("data", {}) if res_wallet and res_wallet.get("ok") else {}
+        if isinstance(wallet_res_data, dict) and "data" in wallet_res_data:
+            wallet_data = wallet_res_data.get("data", {})
+        else:
+            wallet_data = wallet_res_data if isinstance(wallet_res_data, dict) else {}
+
+        inv_res_data = res_inv.get("data", {}) if res_inv and res_inv.get("ok") else {}
+        if isinstance(inv_res_data, dict) and "data" in inv_res_data:
+            inv_data = inv_res_data.get("data")
+        else:
+            inv_data = inv_res_data
+
+        if isinstance(crops_data, dict):
+            crops = crops_data.get("crops") or crops_data.get("data") or []
+            max_slots = crops_data.get("maxSlots", 10)
+        elif isinstance(crops_data, list):
+            crops = crops_data
+            max_slots = crops_res_data.get("maxSlots", 10) if isinstance(crops_res_data, dict) else 10
+        else:
+            crops = []
+            max_slots = 10
+
         mature_count = sum(1 for c in crops if c.get("isMature"))
         debuff_count = sum(1 for c in crops if not c.get("isMature") and c.get("conditions"))
         growing_count = sum(1 for c in crops if not c.get("isMature"))
         empty_slots = max(0, max_slots - len(crops))
 
-        balance_raw = wallet_data.get("wallet", {}).get("balance", 0)
+        balance_raw = wallet_data.get("wallet", {}).get("balance", 0) if isinstance(wallet_data, dict) else 0
         balance_display = f"${balance_raw / 500000:.2f}"
 
         # 背包种子
-        inventory = inv_data.get("inventory") or inv_data.get("data") or []
+        if isinstance(inv_data, dict):
+            inventory = inv_data.get("inventory") or inv_data.get("data") or []
+        elif isinstance(inv_data, list):
+            inventory = inv_data
+        else:
+            inventory = []
         
         return {
             "max_slots": max_slots,
