@@ -2,35 +2,104 @@
 """
 hybgzs 轻松农场自动化 (cdk.hybgzs.com/entertainment/farm)
 
-红线:
-1. 复用 headed CDP（自动发现端口），不 launch / 不杀 Chrome
-2. 默认 destroyIfFull=false（不毁菜）
-3. 默认只种背包库存，不自动扣币买种（--allow-buy 才可）
-4. CF/人机：页面等待，不秒退
+设计:
+- 一次性 CLI（默认不常驻）→ 跑完断开 CDP，控 CPU/内存
+- 复用 headed 已登录 Chrome；自动发现 CDP；不 launch / 不杀 Chrome
+- 页面内 fetch 带 Cookie；写操作 DOM 优先 + API 校验
+- 智能: care→harvest→recheck→plant；种子按价值/时长评分，库存优先
 
-智能点:
-- 种子按 单位时间价值 harvestValue/growthTime 排序，库存优先
-- 可多种子填空：先耗库存高价值，再可选购种
-- run: care → harvest → recheck → plant
-- status: 下次成熟 ETA / 仓库占用 / 动作建议
-- 写操作后复检状态验收
+红线:
+1. 不杀 Chrome
+2. destroyIfFull 默认 false
+3. 购种默认关（--allow-buy）
+4. CF/人机 headed 等待，不秒退假装成功
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
+import fcntl
 import json
+import logging
+import os
 import sys
 import time
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import websockets
 
 FARM_URL = "https://cdk.hybgzs.com/entertainment/farm"
 COIN_DIV = 500_000
+DEFAULT_LOG_DIR = Path.home() / ".cache" / "hybgzs-farm"
+DEFAULT_LOCK = DEFAULT_LOG_DIR / "farm_runner.lock"
+# 资源: 小缓冲、短超时、不常驻
+CDP_MAX_SIZE = 4 * 1024 * 1024
+CDP_OPEN_TIMEOUT = 8
+CDP_CALL_TIMEOUT = 15
+PAGE_READY_MAX_POLLS = 8
+
+log = logging.getLogger("hybgzs.farm")
+
+
+def setup_logging(level: str = "INFO", log_file: Optional[str] = None, json_mode: bool = False) -> Path:
+    DEFAULT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = Path(log_file) if log_file else DEFAULT_LOG_DIR / f"farm-{datetime.now().strftime('%Y%m%d')}.log"
+    root = logging.getLogger("hybgzs.farm")
+    root.handlers.clear()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    fmt = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    # 文件始终详细
+    fh = logging.FileHandler(path, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
+    if not json_mode:
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setLevel(getattr(logging, level.upper(), logging.INFO))
+        sh.setFormatter(fmt)
+        root.addHandler(sh)
+    return path
+
+
+class SingleInstance:
+    """文件锁：防止并发多开打爆 CDP/CPU。"""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.fp = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fp = open(self.path, "w")
+        try:
+            fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.fp.close()
+            self.fp = None
+            return False
+        self.fp.write(f"pid={os.getpid()} started={datetime.now().isoformat()}\n")
+        self.fp.flush()
+        return True
+
+    def release(self):
+        if self.fp:
+            try:
+                fcntl.flock(self.fp.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                self.fp.close()
+            except Exception:
+                pass
+            self.fp = None
 
 
 def discover_cdp(ports: Optional[list[int]] = None) -> tuple[Optional[str], Optional[str], Optional[int]]:
@@ -38,7 +107,7 @@ def discover_cdp(ports: Optional[list[int]] = None) -> tuple[Optional[str], Opti
     for p in ports:
         try:
             op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with op.open(f"http://127.0.0.1:{p}/json/version", timeout=1.5) as resp:
+            with op.open(f"http://127.0.0.1:{p}/json/version", timeout=1.2) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 ws = data.get("webSocketDebuggerUrl")
                 if ws:
@@ -55,8 +124,12 @@ def coin_fmt(raw: Any) -> str:
         return "$?"
 
 
+def clip(obj: Any, n: int = 400) -> str:
+    s = obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False, default=str)
+    return s if len(s) <= n else s[:n] + f"…(+{len(s)-n})"
+
+
 def unwrap_api(resp: Optional[dict]) -> tuple[bool, Any, Optional[str]]:
-    """Return (ok, payload, err_msg). payload prefers nested data."""
     if not resp:
         return False, None, "empty response"
     if not resp.get("ok") and resp.get("status", 0) not in (200, 201):
@@ -81,7 +154,6 @@ def extract_list(payload: Any, *keys: str) -> list:
         v = payload.get(k)
         if isinstance(v, list):
             return v
-    # nested data
     d = payload.get("data")
     if isinstance(d, list):
         return d
@@ -94,62 +166,71 @@ def extract_list(payload: Any, *keys: str) -> list:
 
 
 class FarmClient:
-    def __init__(self, browser_ws: str, verbose: bool = True):
+    def __init__(self, browser_ws: str, http_base: str):
         self.browser_ws = browser_ws
-        self.verbose = verbose
+        self.http_base = http_base.rstrip("/")
         self.ws = None
         self.sid = None
         self.target_id = None
         self.req_id = 0
         self.created_tab = False
         self._lock = asyncio.Lock()
-
-    def log(self, *a):
-        if self.verbose:
-            print(*a)
+        self._status_cache: Optional[dict] = None
+        self._status_cache_at = 0.0
+        self.stats = {
+            "cdp_calls": 0,
+            "api_calls": 0,
+            "t0": time.monotonic(),
+        }
 
     async def connect(self):
+        t0 = time.monotonic()
         self.ws = await websockets.connect(
-            self.browser_ws, max_size=32 * 1024 * 1024, open_timeout=12
+            self.browser_ws,
+            max_size=CDP_MAX_SIZE,
+            open_timeout=CDP_OPEN_TIMEOUT,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=3,
         )
         tabs = (await self.call_browser("Target.getTargets")).get("targetInfos", [])
         pages = [t for t in tabs if t.get("type") == "page"]
-        # prefer exact farm page
-        target = next(
-            (t for t in pages if "entertainment/farm" in (t.get("url") or "")),
-            None,
-        )
+        target = next((t for t in pages if "entertainment/farm" in (t.get("url") or "")), None)
         if not target:
             target = next((t for t in pages if "hybgzs.com" in (t.get("url") or "")), None)
         if target:
             self.target_id = target["targetId"]
-            self.log(f"[CDP] 复用标签: {self.target_id[:8]}… {(target.get('url') or '')[:60]}")
+            log.info("cdp.reuse_tab id=%s url=%s", self.target_id[:8], (target.get("url") or "")[:80])
         else:
             create_res = await self.call_browser("Target.createTarget", {"url": "about:blank"})
             self.target_id = create_res["targetId"]
             self.created_tab = True
-            self.log(f"[CDP] 创建临时标签: {self.target_id[:8]}…")
+            log.info("cdp.new_tab id=%s", self.target_id[:8])
 
         attach = await self.call_browser(
             "Target.attachToTarget", {"targetId": self.target_id, "flatten": True}
         )
         self.sid = attach["sessionId"]
+        # 资源: 只开 Page+Runtime；不开 Network（避免事件洪泛占 CPU/内存）
         await self.call_tab("Page.enable")
         await self.call_tab("Runtime.enable")
-        await self.call_tab("Network.enable")
+        log.info("cdp.connected ms=%.0f", (time.monotonic() - t0) * 1000)
 
     async def call_browser(self, method: str, params: Optional[dict] = None) -> dict:
         async with self._lock:
             self.req_id += 1
             rid = self.req_id
+            self.stats["cdp_calls"] += 1
             msg: dict[str, Any] = {"id": rid, "method": method}
             if params is not None:
                 msg["params"] = params
             await self.ws.send(json.dumps(msg))
             while True:
-                data = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=25))
+                raw = await asyncio.wait_for(self.ws.recv(), timeout=CDP_CALL_TIMEOUT)
+                data = json.loads(raw)
                 if data.get("id") == rid:
                     if "error" in data:
+                        log.error("cdp.browser_err method=%s err=%s", method, data["error"])
                         raise RuntimeError(f"CDP browser {method}: {data['error']}")
                     return data.get("result") or {}
 
@@ -157,18 +238,17 @@ class FarmClient:
         async with self._lock:
             self.req_id += 1
             rid = self.req_id
-            msg: dict[str, Any] = {
-                "id": rid,
-                "method": method,
-                "sessionId": self.sid,
-            }
+            self.stats["cdp_calls"] += 1
+            msg: dict[str, Any] = {"id": rid, "method": method, "sessionId": self.sid}
             if params is not None:
                 msg["params"] = params
             await self.ws.send(json.dumps(msg))
             while True:
-                data = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=25))
+                raw = await asyncio.wait_for(self.ws.recv(), timeout=CDP_CALL_TIMEOUT)
+                data = json.loads(raw)
                 if data.get("id") == rid:
                     if "error" in data:
+                        log.error("cdp.tab_err method=%s err=%s", method, data["error"])
                         raise RuntimeError(f"CDP tab {method}: {data['error']}")
                     return data.get("result") or {}
 
@@ -186,11 +266,11 @@ class FarmClient:
     async def ensure_page_loaded(self) -> bool:
         url = await self.evaluate("location.href")
         if FARM_URL not in str(url):
-            self.log(f"[CDP] 导航 {FARM_URL}")
+            log.info("cdp.navigate url=%s", FARM_URL)
             await self.call_tab("Page.navigate", {"url": FARM_URL})
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(1.5)
 
-        await self.evaluate(
+        closed = await self.evaluate(
             """(() => {
               const btns=[...document.querySelectorAll('button')];
               const known=btns.find(x=>(x.innerText||'').includes('我知道了'));
@@ -198,27 +278,33 @@ class FarmClient:
               return 'none';
             })()"""
         )
+        if closed == "closed":
+            log.info("ui.notice_closed")
 
-        for _ in range(15):
-            text = str(await self.evaluate("document.body?document.body.innerText:''") or "")
+        for i in range(PAGE_READY_MAX_POLLS):
+            text = str(await self.evaluate("document.body?document.body.innerText.slice(0,2000):''") or "")
             if "获取农场数据失败" in text or "重新登录" in text:
-                # one retry click
+                log.warning("ui.load_fail poll=%s — retry button", i)
                 await self.evaluate(
                     """(() => {
                       const b=[...document.querySelectorAll('button')].find(x=>(x.innerText||'').includes('重试'));
                       if(b){b.click();return 'retry';} return 'no';
                     })()"""
                 )
-                await asyncio.sleep(2)
-                text = str(await self.evaluate("document.body?document.body.innerText:''") or "")
+                await asyncio.sleep(1.5)
+                text = str(await self.evaluate("document.body?document.body.innerText.slice(0,2000):''") or "")
                 if "获取农场数据失败" in text or "重新登录" in text:
-                    raise RuntimeError("农场数据加载失败 / 未登录。请在 headed Chrome 登录 cdk.hybgzs.com")
+                    raise RuntimeError("农场数据加载失败/未登录。请在 headed Chrome 登录 cdk.hybgzs.com")
             if "轻松农场" in text or "我的农田" in text or "一键务农" in text:
+                log.debug("ui.ready poll=%s", i)
                 return True
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(0.5)
+        log.warning("ui.ready_timeout — continue anyway")
         return True
 
     async def fetch_api(self, path: str, method: str = "GET", body: Any = None) -> dict:
+        self.stats["api_calls"] += 1
+        t0 = time.monotonic()
         js = f"""(async () => {{
             try {{
                 const opts = {{
@@ -235,34 +321,48 @@ class FarmClient:
                 return {{ status: 0, ok: false, error: String(e && e.message || e) }};
             }}
         }})()"""
-        return await self.evaluate(js, await_promise=True) or {"ok": False, "status": 0}
+        out = await self.evaluate(js, await_promise=True) or {"ok": False, "status": 0}
+        ms = (time.monotonic() - t0) * 1000
+        ok, payload, err = unwrap_api(out)
+        level = logging.INFO if method != "GET" else logging.DEBUG
+        log.log(
+            level,
+            "api %s %s status=%s ok=%s ms=%.0f err=%s body=%s",
+            method,
+            path,
+            out.get("status"),
+            ok,
+            ms,
+            err,
+            clip(payload, 240) if method != "GET" else clip(payload, 120),
+        )
+        return out
 
-    async def get_farm_status(self) -> dict:
+    async def get_farm_status(self, use_cache_s: float = 0.0) -> dict:
+        if use_cache_s > 0 and self._status_cache and (time.monotonic() - self._status_cache_at) < use_cache_s:
+            log.debug("status.cache_hit age=%.2f", time.monotonic() - self._status_cache_at)
+            return self._status_cache
+
         await self.ensure_page_loaded()
-        # websockets 单连接不可并发 recv，顺序拉取
+        # 顺序拉取；需要种植时才拉 seeds（由调用方 need_seeds）
         res_crops = await self.fetch_api("/api/farm/crops")
         res_energy = await self.fetch_api("/api/farm/energy/status")
         res_wallet = await self.fetch_api("/api/wallet/balance")
         res_inv = await self.fetch_api("/api/farm/inventory")
-        res_seeds = await self.fetch_api("/api/farm/seeds")
-        res_plots = {"ok": True, "status": 200, "data": {"success": True, "data": {}}}
 
         ok_c, crops_payload, err_c = unwrap_api(res_crops)
         if not ok_c:
             raise RuntimeError(f"crops API 失败: {err_c}")
 
-        # crops payload: {success, data:[], crops:[], maxSlots,...} OR list in data
         crops_root = crops_payload if isinstance(crops_payload, dict) else {}
         crops = extract_list(crops_payload, "crops", "data")
         if not crops and isinstance(crops_payload, list):
             crops = crops_payload
-        max_slots = int(crops_root.get("maxSlots") or crops_root.get("baseSlots") or 10)
-        if isinstance(crops_payload, dict) and isinstance(crops_payload.get("data"), dict):
-            max_slots = int(crops_payload["data"].get("maxSlots") or max_slots)
-
-        # if top-level maxSlots on HTTP wrapper path
-        if res_crops and isinstance(res_crops.get("data"), dict):
-            max_slots = int(res_crops["data"].get("maxSlots") or max_slots)
+        max_slots = 10
+        if isinstance(res_crops.get("data"), dict):
+            max_slots = int(res_crops["data"].get("maxSlots") or res_crops["data"].get("baseSlots") or 10)
+        if isinstance(crops_root, dict):
+            max_slots = int(crops_root.get("maxSlots") or crops_root.get("baseSlots") or max_slots)
 
         ok_e, energy_payload, _ = unwrap_api(res_energy)
         energy = {}
@@ -284,38 +384,23 @@ class FarmClient:
             if not inventory and isinstance(inv_payload.get("data"), list):
                 inventory = inv_payload["data"]
 
-        ok_s, seeds_payload, _ = unwrap_api(res_seeds)
-        seeds = []
-        if ok_s:
-            if isinstance(seeds_payload, dict):
-                seeds = seeds_payload.get("seeds") or extract_list(seeds_payload, "seeds", "data")
-            elif isinstance(seeds_payload, list):
-                seeds = seeds_payload
-
-        ok_p, plots_payload, _ = unwrap_api(res_plots)
-        plots = plots_payload.get("data") if isinstance(plots_payload, dict) and isinstance(plots_payload.get("data"), dict) else (plots_payload if isinstance(plots_payload, dict) else {})
-
         mature = [c for c in crops if c.get("isMature") and not c.get("isHarvested")]
         growing = [c for c in crops if not c.get("isMature") and not c.get("isHarvested")]
         debuff_crops = []
         for c in growing:
             conds = c.get("conditions") or []
-            has = bool(conds) or any(
-                c.get(k) for k in ("thirstyStartedAt", "weedStartedAt", "pestStartedAt")
-            )
+            has = bool(conds) or any(c.get(k) for k in ("thirstyStartedAt", "weedStartedAt", "pestStartedAt"))
             if has:
                 debuff_crops.append(c)
 
         empty_slots = max(0, max_slots - len([c for c in crops if not c.get("isHarvested")]))
-        # if all mature about to harvest, empty after harvest would be max_slots
         next_mature_sec = None
         if growing:
             rems = [int(c.get("remainingTime") or 0) for c in growing]
             next_mature_sec = min(rems) if rems else None
 
         inv_qty = {str(i.get("seedId")): int(i.get("quantity") or 0) for i in inventory if i.get("seedId")}
-
-        return {
+        st = {
             "max_slots": max_slots,
             "planted_count": len(crops),
             "empty_slots": empty_slots,
@@ -328,18 +413,45 @@ class FarmClient:
             "balance_raw": balance_raw,
             "balance": coin_fmt(balance_raw),
             "crops": crops,
-            "mature": mature,
-            "growing": growing,
             "inventory": inventory,
             "inventory_qty": inv_qty,
-            "seeds": seeds,
+            "seeds": [],  # lazy
             "warehouse": warehouse,
-            "plots": plots,
             "next_mature_sec": next_mature_sec,
-            "suggestions": self._suggest(
-                len(mature), len(debuff_crops), empty_slots, inv_qty, warehouse
-            ),
+            "suggestions": self._suggest(len(mature), len(debuff_crops), empty_slots, inv_qty, warehouse),
         }
+        self._status_cache = st
+        self._status_cache_at = time.monotonic()
+        log.info(
+            "status mature=%s growing=%s debuff=%s empty=%s bal=%s energy=%s warehouse=%s/%s next_mature=%s",
+            st["mature_count"],
+            st["growing_count"],
+            st["debuff_count"],
+            st["empty_slots"],
+            st["balance"],
+            st["energy"],
+            (warehouse or {}).get("usedCapacity"),
+            (warehouse or {}).get("capacity"),
+            st["next_mature_sec"],
+        )
+        return st
+
+    async def load_seeds(self, st: dict) -> list:
+        if st.get("seeds"):
+            return st["seeds"]
+        res = await self.fetch_api("/api/farm/seeds")
+        ok, payload, err = unwrap_api(res)
+        seeds = []
+        if ok:
+            if isinstance(payload, dict):
+                seeds = payload.get("seeds") or extract_list(payload, "seeds", "data")
+            elif isinstance(payload, list):
+                seeds = payload
+        else:
+            log.warning("seeds.load_fail err=%s", err)
+        st["seeds"] = seeds or []
+        log.info("seeds.loaded n=%s", len(st["seeds"]))
+        return st["seeds"]
 
     def _suggest(self, mature, debuff, empty, inv_qty, warehouse) -> list[str]:
         s = []
@@ -350,33 +462,31 @@ class FarmClient:
             used = int((warehouse or {}).get("usedCapacity") or 0)
             cap = int((warehouse or {}).get("capacity") or 0)
             if cap and used >= cap * 0.9:
-                s.append(f"仓库将满 {used}/{cap}，收菜可能 WAREHOUSE_FULL")
+                s.append(f"仓库将满 {used}/{cap}")
         if empty:
             stock = sum(inv_qty.values())
             if stock >= empty:
-                s.append(f"建议补种：{empty} 空位，库存种子 {stock}")
+                s.append(f"建议补种：空{empty} 库存{stock}")
             elif stock > 0:
-                s.append(f"建议部分补种：空位 {empty}，库存仅 {stock}（默认不买种）")
+                s.append(f"部分补种：空{empty} 库存{stock}（默认不买）")
             else:
-                s.append(f"空位 {empty} 但无库存种子（需 --allow-buy 才购种）")
+                s.append(f"空{empty} 无库存（需 --allow-buy）")
         if not s:
             s.append("无事可做（生长中）")
         return s
 
     def score_seed(self, seed: dict, inv_qty: dict[str, int]) -> float:
-        """Higher is better. Inventory bonus; VIP without stock penalized unless allowed later."""
         sid = str(seed.get("id") or seed.get("seedId") or "")
         try:
             gt = max(1, int(seed.get("growthTime") or 1))
             hv = int(seed.get("harvestValue") or 0)
             hq = int(seed.get("harvestQuantity") or 1)
-            # value per second * harvest qty weight
             base = (hv * max(hq, 1)) / gt
         except Exception:
             base = 0.0
         stock = inv_qty.get(sid, 0)
         if stock > 0:
-            base *= 1.25  # prefer inventory
+            base *= 1.25
             base += stock * 0.01
         if seed.get("isVipOnly") and stock <= 0:
             base *= 0.05
@@ -393,20 +503,14 @@ class FarmClient:
         allow_buy: bool,
         prefer_seed: Optional[str] = None,
     ) -> list[dict]:
-        """Return list of {seedId, name, quantity, from_stock, need_buy, cost}."""
         if empty <= 0:
             return []
-        inv_qty = {
-            str(i.get("seedId")): int(i.get("quantity") or 0)
-            for i in inventory
-            if i.get("seedId")
-        }
-        seed_by_id = {}
+        inv_qty = {str(i.get("seedId")): int(i.get("quantity") or 0) for i in inventory if i.get("seedId")}
+        seed_by_id: dict[str, dict] = {}
         for s in seeds:
             sid = str(s.get("id") or "")
             if sid:
                 seed_by_id[sid] = s
-        # synthesize seed meta from inventory if missing in /seeds
         for i in inventory:
             sid = str(i.get("seedId") or "")
             if sid and sid not in seed_by_id:
@@ -420,20 +524,15 @@ class FarmClient:
                     "isVipOnly": bool(i.get("isVipOnly")),
                     "isEnabled": True,
                 }
-
         candidates = list(seed_by_id.values())
         if prefer_seed:
             candidates = [s for s in candidates if str(s.get("id")) == prefer_seed] or candidates
-
-        # only enabled
         candidates = [s for s in candidates if s.get("isEnabled") is not False]
         candidates.sort(key=lambda s: self.score_seed(s, inv_qty), reverse=True)
 
         plan = []
         remain = empty
         bal = balance_raw
-
-        # Phase 1: inventory only
         for s in candidates:
             if remain <= 0:
                 break
@@ -450,18 +549,14 @@ class FarmClient:
                     "from_stock": use,
                     "need_buy": 0,
                     "cost": 0,
+                    "score": round(self.score_seed(s, inv_qty), 4),
                 }
             )
             inv_qty[sid] = stock - use
             remain -= use
 
-        # Phase 2: optional buy cheapest/high score non-vip
         if allow_buy and remain > 0:
-            buyable = [
-                s
-                for s in candidates
-                if not s.get("isVipOnly") and int(s.get("price") or 0) >= 0 and s.get("isEnabled") is not False
-            ]
+            buyable = [s for s in candidates if not s.get("isVipOnly") and s.get("isEnabled") is not False]
             buyable.sort(key=lambda s: self.score_seed(s, inv_qty), reverse=True)
             for s in buyable:
                 if remain <= 0:
@@ -469,7 +564,6 @@ class FarmClient:
                 sid = str(s.get("id"))
                 price = int(s.get("price") or 0)
                 if price <= 0:
-                    # free? treat as plant without buy
                     use = remain
                     plan.append(
                         {
@@ -479,11 +573,12 @@ class FarmClient:
                             "from_stock": 0,
                             "need_buy": 0,
                             "cost": 0,
+                            "score": round(self.score_seed(s, inv_qty), 4),
                         }
                     )
                     remain = 0
                     break
-                can_buy = bal // price if price else 0
+                can_buy = bal // price
                 use = min(remain, can_buy)
                 if use <= 0:
                     continue
@@ -496,12 +591,12 @@ class FarmClient:
                         "from_stock": 0,
                         "need_buy": use,
                         "cost": cost,
+                        "score": round(self.score_seed(s, inv_qty), 4),
                     }
                 )
                 bal -= cost
                 remain -= use
 
-        # merge same seedId
         merged: dict[str, dict] = {}
         for p in plan:
             m = merged.setdefault(
@@ -513,16 +608,19 @@ class FarmClient:
                     "from_stock": 0,
                     "need_buy": 0,
                     "cost": 0,
+                    "score": p.get("score"),
                 },
             )
             m["quantity"] += p["quantity"]
             m["from_stock"] += p["from_stock"]
             m["need_buy"] += p["need_buy"]
             m["cost"] += p["cost"]
-        return list(merged.values())
+        out = list(merged.values())
+        log.info("plant.plan empty=%s remain=%s steps=%s detail=%s", empty, remain, len(out), clip(out, 300))
+        return out
 
     async def care_all(self) -> dict:
-        self.log("[操作] 一键务农…")
+        log.info("action.care start")
         click_res = await self.evaluate(
             """(() => {
               const btn = document.querySelector('[aria-label="一键务农"], [data-testid="care-actions-desktop"], [data-testid="care-actions-mobile"]');
@@ -531,18 +629,18 @@ class FarmClient:
             })()"""
         )
         if click_res == "clicked_dom":
-            self.log("[操作] DOM 点击「一键务农」")
-            await asyncio.sleep(2.5)
+            log.info("action.care via=DOM")
+            await asyncio.sleep(1.2)
+            self._status_cache = None
             return {"success": True, "via": "DOM"}
-        self.log("[操作] DOM 不可用 → API /api/farm/care/all")
+        log.info("action.care via=API")
         res = await self.fetch_api("/api/farm/care/all", method="POST", body={})
         ok, payload, err = unwrap_api(res)
-        self.log(f"[API] care/all ok={ok} err={err} body={json.dumps(payload, ensure_ascii=False)[:300]}")
+        self._status_cache = None
         return {"success": ok, "via": "API", "payload": payload, "error": err}
 
     async def harvest_all(self, destroy_if_full: bool = False) -> dict:
-        self.log(f"[操作] 一键收菜 destroyIfFull={destroy_if_full}…")
-        # try DOM first
+        log.info("action.harvest start destroyIfFull=%s", destroy_if_full)
         click_res = await self.evaluate(
             r"""(() => {
               const btns=[...document.querySelectorAll('button')];
@@ -555,9 +653,8 @@ class FarmClient:
             })()"""
         )
         if str(click_res).startswith("clicked_dom"):
-            self.log(f"[操作] DOM {click_res}")
-            await asyncio.sleep(2.0)
-            # 不信任 DOM 单独成功，继续 API 或状态验收
+            log.info("action.harvest dom=%s", click_res)
+            await asyncio.sleep(1.0)
 
         res = await self.fetch_api(
             "/api/farm/harvest-all",
@@ -565,20 +662,18 @@ class FarmClient:
             body={"destroyIfFull": bool(destroy_if_full)},
         )
         ok, payload, err = unwrap_api(res)
+        data = payload.get("data") if isinstance(payload, dict) else payload
         code = None
         if isinstance(payload, dict):
             code = (payload.get("error") or {}).get("code")
-            data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        else:
-            data = payload
-        if code == "WAREHOUSE_FULL" or (isinstance(payload, dict) and (payload.get("error") or {}).get("code") == "WAREHOUSE_FULL"):
-            self.log("⚠️ 仓库已满，拒绝毁菜（未开 --destroy-if-full）")
-        self.log(
-            f"[API] harvest-all ok={ok} err={err} data={json.dumps(data, ensure_ascii=False)[:400]}"
-        )
+        if code == "WAREHOUSE_FULL":
+            log.warning("action.harvest warehouse_full — refuse destroy")
+        log.info("action.harvest done ok=%s err=%s data=%s", ok, err, clip(data, 300))
+        self._status_cache = None
         return {"success": ok, "via": "API", "payload": payload, "error": err, "data": data}
 
     async def plant_batch(self, seed_id: str, quantity: int) -> dict:
+        log.info("action.plant seed=%s qty=%s", seed_id, quantity)
         res = await self.fetch_api(
             "/api/farm/plant-batch",
             method="POST",
@@ -586,9 +681,7 @@ class FarmClient:
         )
         ok, payload, err = unwrap_api(res)
         data = payload.get("data") if isinstance(payload, dict) else payload
-        self.log(
-            f"[API] plant-batch {seed_id} x{quantity} ok={ok} err={err} data={json.dumps(data, ensure_ascii=False)[:300]}"
-        )
+        self._status_cache = None
         return {"success": ok, "payload": payload, "error": err, "data": data}
 
     async def plant_smart(
@@ -602,26 +695,26 @@ class FarmClient:
         st = status or await self.get_farm_status()
         empty = empty_override if empty_override is not None else st["empty_slots"]
         if empty <= 0:
-            self.log("[提示] 无空位")
+            log.info("action.plant skip reason=full")
             return {"success": True, "planted": 0, "plan": [], "reason": "full"}
 
+        await self.load_seeds(st)
         plan = self.plan_planting(
-            empty,
-            st["inventory"],
-            st["seeds"],
-            st["balance_raw"],
-            allow_buy=allow_buy,
-            prefer_seed=prefer_seed,
+            empty, st["inventory"], st["seeds"], st["balance_raw"], allow_buy=allow_buy, prefer_seed=prefer_seed
         )
         if not plan:
-            self.log("[提示] 无可用种植方案（无库存且未 --allow-buy / 余额不足）")
+            log.warning("action.plant no_plan allow_buy=%s", allow_buy)
             return {"success": False, "planted": 0, "plan": [], "reason": "no_plan"}
 
-        self.log("[计划] 种植方案:")
         for p in plan:
-            self.log(
-                f"  - {p['name']}({p['seedId']}) x{p['quantity']} "
-                f"库存{p['from_stock']} 购{p['need_buy']} 成本{coin_fmt(p['cost'])}"
+            log.info(
+                "plant.step %s x%s stock=%s buy=%s cost=%s score=%s",
+                p["name"],
+                p["quantity"],
+                p["from_stock"],
+                p["need_buy"],
+                coin_fmt(p["cost"]),
+                p.get("score"),
             )
         if dry_run:
             return {"success": True, "planted": 0, "plan": plan, "dry_run": True}
@@ -630,11 +723,12 @@ class FarmClient:
         results = []
         for p in plan:
             r = await self.plant_batch(p["seedId"], p["quantity"])
-            results.append(r)
+            results.append({"seedId": p["seedId"], **{k: r.get(k) for k in ("success", "error", "data")}})
             if r.get("success"):
                 data = r.get("data") or {}
                 total += int(data.get("plantedCount") or p["quantity"] or 0)
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(0.4)
+        log.info("action.plant done planted=%s", total)
         return {"success": total > 0, "planted": total, "plan": plan, "results": results}
 
     async def run_pipeline(
@@ -644,14 +738,15 @@ class FarmClient:
         prefer_seed: Optional[str] = None,
         dry_run: bool = False,
     ) -> dict:
-        self.log(">>> 智能流水线 Care → Harvest → Recheck → Plant <<<")
+        log.info("pipeline.start dry_run=%s allow_buy=%s destroy=%s", dry_run, allow_buy, destroy_if_full)
         before = await self.get_farm_status()
         self.print_status(before)
-        report = {
+        report: dict[str, Any] = {
             "before": {
                 "mature": before["mature_count"],
                 "debuff": before["debuff_count"],
                 "empty": before["empty_slots"],
+                "next_mature_sec": before["next_mature_sec"],
             },
             "care": None,
             "harvest": None,
@@ -659,141 +754,166 @@ class FarmClient:
             "after": None,
         }
 
+        did_write = False
         if before["debuff_count"] > 0:
             if dry_run:
-                self.log(f"[dry-run] 将务农 debuff={before['debuff_count']}")
-                report["care"] = {"dry_run": True}
+                log.info("pipeline.care dry-run debuff=%s", before["debuff_count"])
+                report["care"] = {"dry_run": True, "debuff": before["debuff_count"]}
             else:
                 report["care"] = await self.care_all()
-                await asyncio.sleep(1.5)
+                did_write = True
+                await asyncio.sleep(0.5)
         else:
-            self.log("[跳过] 无需务农")
+            log.info("pipeline.care skip")
 
-        # re-read mature after care
-        mid = await self.get_farm_status()
+        # 无写操作则复用 before，少打 1 轮 API
+        mid = await self.get_farm_status() if did_write else before
         if mid["mature_count"] > 0:
             if dry_run:
-                self.log(f"[dry-run] 将收菜 mature={mid['mature_count']}")
+                log.info("pipeline.harvest dry-run mature=%s", mid["mature_count"])
                 report["harvest"] = {"dry_run": True, "mature": mid["mature_count"]}
             else:
                 report["harvest"] = await self.harvest_all(destroy_if_full=destroy_if_full)
-                await asyncio.sleep(1.5)
+                did_write = True
+                await asyncio.sleep(0.5)
         else:
-            self.log("[跳过] 无可收作物")
+            log.info("pipeline.harvest skip")
 
-        after_h = await self.get_farm_status()
-        # dry-run: 假设已收成熟株 → 空位 = 原空位 + 成熟数
+        after_h = await self.get_farm_status() if did_write else mid
         empty_for_plant = after_h["empty_slots"]
         if dry_run and mid["mature_count"] > 0:
             empty_for_plant = after_h["empty_slots"] + mid["mature_count"]
-            self.log(f"[dry-run] 假设收后空位={empty_for_plant}")
+            log.info("pipeline.plant dry-run assume_empty=%s", empty_for_plant)
 
         if empty_for_plant > 0:
-            if dry_run and empty_for_plant != after_h["empty_slots"]:
-                # 临时覆盖 empty 做规划
-                fake = dict(after_h)
-                fake["empty_slots"] = empty_for_plant
-                plan = self.plan_planting(
-                    empty_for_plant,
-                    after_h["inventory"],
-                    after_h["seeds"],
-                    after_h["balance_raw"],
-                    allow_buy=allow_buy,
-                    prefer_seed=prefer_seed,
-                )
-                self.log("[dry-run] 种植方案:")
-                for p in plan:
-                    self.log(
-                        f"  - {p['name']} x{p['quantity']} 库存{p['from_stock']} 购{p['need_buy']}"
-                    )
-                report["plant"] = {"success": True, "planted": 0, "plan": plan, "dry_run": True}
-            else:
-                report["plant"] = await self.plant_smart(
-                    allow_buy=allow_buy, prefer_seed=prefer_seed, dry_run=dry_run
-                )
+            report["plant"] = await self.plant_smart(
+                allow_buy=allow_buy,
+                prefer_seed=prefer_seed,
+                dry_run=dry_run,
+                status=after_h,
+                empty_override=empty_for_plant if dry_run else None,
+            )
+            if not dry_run and report["plant"].get("planted"):
+                did_write = True
         else:
-            self.log("[跳过] 无空位可种")
+            log.info("pipeline.plant skip")
             report["plant"] = {"success": True, "planted": 0, "reason": "no_empty"}
 
-        after = await self.get_farm_status()
+        after = await self.get_farm_status() if did_write else after_h
         report["after"] = {
             "mature": after["mature_count"],
             "debuff": after["debuff_count"],
             "empty": after["empty_slots"],
             "planted": after["planted_count"],
+            "growing": after["growing_count"],
             "balance": after["balance"],
             "next_mature_sec": after["next_mature_sec"],
             "suggestions": after["suggestions"],
         }
-        self.log(">>> 流水线结束 <<<")
+        report["resource"] = self.resource_snapshot()
+        log.info(
+            "pipeline.done resource=%s after=%s",
+            report["resource"],
+            clip(report["after"], 200),
+        )
         self.print_status(after)
         return report
+
+    def resource_snapshot(self) -> dict:
+        return {
+            "elapsed_s": round(time.monotonic() - self.stats["t0"], 2),
+            "cdp_calls": self.stats["cdp_calls"],
+            "api_calls": self.stats["api_calls"],
+            "rss_mb": self._rss_mb(),
+        }
+
+    def _rss_mb(self) -> Optional[float]:
+        try:
+            import resource
+
+            # macOS ru_maxrss is bytes
+            rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            if sys.platform == "darwin":
+                return round(rss / (1024 * 1024), 2)
+            return round(rss / 1024, 2)
+        except Exception:
+            return None
 
     def print_status(self, st: dict):
         nm = st.get("next_mature_sec")
         if nm is None:
             eta = "-"
         elif nm <= 0:
-            eta = "已可收 / 即将可收"
+            eta = "已可收"
         else:
             eta = f"{nm // 60}分{nm % 60}秒"
         wh = st.get("warehouse") or {}
-        used = wh.get("usedCapacity")
-        cap = wh.get("capacity")
+        used, cap = wh.get("usedCapacity"), wh.get("capacity")
         wh_s = f"{used}/{cap}" if used is not None and cap is not None else "-"
         print("\n========== 轻松农场状态 ==========")
         print(f"余额       : {st['balance']}")
         print(f"体力       : {st['energy']}")
         print(f"地块       : {st['planted_count']}/{st['max_slots']} (空 {st['empty_slots']})")
-        print(
-            f"作物       : 待收 {st['mature_count']} | 生长 {st['growing_count']} | 灾害 {st['debuff_count']}"
-        )
+        print(f"作物       : 待收 {st['mature_count']} | 生长 {st['growing_count']} | 灾害 {st['debuff_count']}")
         print(f"下次成熟   : {eta}")
         print(f"仓库       : {wh_s}")
         inv = st.get("inventory") or []
         if inv:
-            inv_s = ", ".join(
-                f"{i.get('seedName') or i.get('seedId')}×{i.get('quantity')}" for i in inv[:8]
-            )
+            inv_s = ", ".join(f"{i.get('seedName') or i.get('seedId')}×{i.get('quantity')}" for i in inv[:8])
             print(f"种子库存   : {inv_s}")
         else:
             print("种子库存   : (空)")
         print("建议       :")
         for s in st.get("suggestions") or []:
             print(f"  - {s}")
+        rs = self.resource_snapshot()
+        print(f"资源       : {rs['elapsed_s']}s cdp={rs['cdp_calls']} api={rs['api_calls']} rss={rs['rss_mb']}MB")
         print("=================================\n")
 
     async def close(self):
-        # do not auto-close user tabs; only close if we created blank temp and navigated? keep tab for login continuity
+        # 若我们创建了临时 tab，关掉以省 Chrome 渲染资源；用户原有 farm 标签保留
+        if self.created_tab and self.target_id:
+            try:
+                await self.call_browser("Target.closeTarget", {"targetId": self.target_id})
+                log.info("cdp.closed_temp_tab id=%s", self.target_id[:8])
+            except Exception as e:
+                log.warning("cdp.close_tab_fail %s", e)
         if self.ws:
             try:
-                await self.ws.close()
+                await asyncio.wait_for(self.ws.close(), timeout=3)
             except Exception:
                 pass
+            self.ws = None
+        log.info("cdp.disconnected stats=%s", self.resource_snapshot())
 
 
-async def main_async(args):
+async def main_async(args) -> int:
     http, ws, port = discover_cdp()
     if not ws:
-        print("[错误] 未发现 CDP。请启动带 --remote-debugging-port 的 headed Chrome 并登录农场。")
-        sys.exit(2)
-    print(f"[CDP] 端口 {port}")
+        log.error("cdp.not_found — 启动带 --remote-debugging-port 的 headed Chrome")
+        return 2
+    log.info("cdp.found port=%s", port)
 
-    client = FarmClient(ws, verbose=not args.json)
+    client = FarmClient(ws, http or f"http://127.0.0.1:{port}")
     code = 0
     try:
         await client.connect()
         if args.mode == "status":
             st = await client.get_farm_status()
             if args.json:
-                print(json.dumps(st, ensure_ascii=False, default=str))
+                out = {k: v for k, v in st.items() if k != "crops"}
+                out["crops_n"] = len(st.get("crops") or [])
+                out["resource"] = client.resource_snapshot()
+                print(json.dumps(out, ensure_ascii=False, default=str))
             else:
                 client.print_status(st)
         elif args.mode == "care":
             r = await client.care_all()
             st = await client.get_farm_status()
             if args.json:
-                print(json.dumps({"care": r, "status": st}, ensure_ascii=False, default=str))
+                print(json.dumps({"care": r, "status_summary": {
+                    "mature": st["mature_count"], "debuff": st["debuff_count"], "empty": st["empty_slots"]
+                }, "resource": client.resource_snapshot()}, ensure_ascii=False, default=str))
             else:
                 client.print_status(st)
             if not r.get("success"):
@@ -802,20 +922,18 @@ async def main_async(args):
             r = await client.harvest_all(destroy_if_full=args.destroy_if_full)
             st = await client.get_farm_status()
             if args.json:
-                print(json.dumps({"harvest": r, "status": st}, ensure_ascii=False, default=str))
+                print(json.dumps({"harvest": r, "resource": client.resource_snapshot()}, ensure_ascii=False, default=str))
             else:
                 client.print_status(st)
             if not r.get("success"):
                 code = 1
         elif args.mode == "plant":
             r = await client.plant_smart(
-                allow_buy=args.allow_buy,
-                prefer_seed=args.seed,
-                dry_run=args.dry_run,
+                allow_buy=args.allow_buy, prefer_seed=args.seed, dry_run=args.dry_run
             )
             st = await client.get_farm_status()
             if args.json:
-                print(json.dumps({"plant": r, "status": st}, ensure_ascii=False, default=str))
+                print(json.dumps({"plant": r, "resource": client.resource_snapshot()}, ensure_ascii=False, default=str))
             else:
                 client.print_status(st)
             if not r.get("success") and r.get("reason") not in ("full",):
@@ -830,34 +948,47 @@ async def main_async(args):
             if args.json:
                 print(json.dumps(r, ensure_ascii=False, default=str))
         else:
-            print("unknown mode")
+            log.error("unknown mode")
             code = 2
     except Exception as e:
-        print(f"[错误] {e}")
-        code = 1 if not args.json else 1
+        log.exception("fatal %s", e)
         if args.json:
             print(json.dumps({"error": str(e)}, ensure_ascii=False))
+        code = 1
     finally:
         await client.close()
-    sys.exit(code)
+    return code
 
 
 def main():
     p = argparse.ArgumentParser(description="hybgzs 轻松农场智能自动化")
-    p.add_argument(
-        "mode",
-        nargs="?",
-        default="status",
-        choices=["status", "run", "care", "harvest", "plant"],
-        help="status | run | care | harvest | plant",
-    )
-    p.add_argument("--destroy-if-full", action="store_true", help="仓库满时允许毁菜（默认关）")
-    p.add_argument("--allow-buy", action="store_true", help="库存不足时允许扣币买种（默认关）")
-    p.add_argument("--seed", default=None, help="优先种子 id，如 carrot")
-    p.add_argument("--dry-run", action="store_true", help="只规划不写操作")
-    p.add_argument("--json", action="store_true", help="JSON 输出")
+    p.add_argument("mode", nargs="?", default="status", choices=["status", "run", "care", "harvest", "plant"])
+    p.add_argument("--destroy-if-full", action="store_true")
+    p.add_argument("--allow-buy", action="store_true")
+    p.add_argument("--seed", default=None)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--log-level", default=os.environ.get("FARM_LOG_LEVEL", "INFO"))
+    p.add_argument("--log-file", default=os.environ.get("FARM_LOG_FILE"))
+    p.add_argument("--no-lock", action="store_true", help="允许并发（不推荐）")
     args = p.parse_args()
-    asyncio.run(main_async(args))
+
+    log_path = setup_logging(args.log_level, args.log_file, json_mode=args.json)
+    log.info("boot mode=%s pid=%s log=%s", args.mode, os.getpid(), log_path)
+
+    lock = SingleInstance(DEFAULT_LOCK)
+    if not args.no_lock:
+        if not lock.acquire():
+            log.error("another farm_runner is running (lock %s)", DEFAULT_LOCK)
+            sys.exit(3)
+        atexit.register(lock.release)
+
+    try:
+        code = asyncio.run(main_async(args))
+    finally:
+        lock.release()
+    log.info("exit code=%s", code)
+    sys.exit(code)
 
 
 if __name__ == "__main__":

@@ -45,3 +45,16 @@ cd hybgzs-farm && python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python3 farm_runner.py run
 ```
+
+## 日志与资源
+
+- 日志目录：`~/.cache/hybgzs-farm/farm-YYYYMMDD.log`
+- 级别：`--log-level DEBUG|INFO|WARNING` 或环境变量 `FARM_LOG_LEVEL`
+- 单实例锁：`~/.cache/hybgzs-farm/farm_runner.lock`（防并发打爆 CDP）
+- 默认**一次性进程**：跑完断开 WebSocket；不开 Network 事件监听；临时 tab 会关
+- 状态行带 `资源: Xs cdp=N api=M rss=MB`
+
+```bash
+python3 farm_runner.py status --log-level DEBUG
+tail -f ~/.cache/hybgzs-farm/farm-$(date +%Y%m%d).log
+```
