@@ -34,6 +34,15 @@ from typing import Any, Optional
 
 import websockets
 
+# 1. 强制清理代理环境变量，防止本地方向请求误走 Privoxy / Proxy 导致 503 假死
+for _proxy_var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"]:
+    os.environ.pop(_proxy_var, None)
+
+_no_proxy = os.environ.get("NO_PROXY", "")
+if "127.0.0.1" not in _no_proxy or "localhost" not in _no_proxy:
+    os.environ["NO_PROXY"] = "127.0.0.1,localhost," + _no_proxy
+    os.environ["no_proxy"] = os.environ["NO_PROXY"]
+
 FARM_URL = "https://cdk.hybgzs.com/entertainment/farm"
 COIN_DIV = 500_000
 DEFAULT_LOG_DIR = Path.home() / ".cache" / "hybgzs-farm"
@@ -151,13 +160,16 @@ def clip(obj: Any, n: int = 400) -> str:
 def unwrap_api(resp: Optional[dict]) -> tuple[bool, Any, Optional[str]]:
     if not resp:
         return False, None, "empty response"
+    if not isinstance(resp, dict):
+        return False, None, f"invalid_response_type:{type(resp).__name__}"
+    data = resp.get("data")
+    if isinstance(data, str):
+        return False, None, f"text_payload:{data[:100]}"
     if not resp.get("ok") and resp.get("status", 0) not in (200, 201):
-        data = resp.get("data")
         err = None
         if isinstance(data, dict):
             err = (data.get("error") or {}).get("message") or data.get("message")
         return False, data, err or resp.get("error") or f"HTTP {resp.get('status')}"
-    data = resp.get("data")
     if isinstance(data, dict) and data.get("success") is False:
         err = (data.get("error") or {}).get("message") or data.get("message") or "success=false"
         return False, data, str(err)
@@ -217,19 +229,48 @@ class FarmClient:
         target = next((t for t in pages if "entertainment/farm" in (t.get("url") or "")), None)
         if not target:
             target = next((t for t in pages if "hybgzs.com" in (t.get("url") or "")), None)
+        
+        target_healthy = False
+        sid = None
         if target:
+            tid = target["targetId"]
+            try:
+                attach = await self.call_browser("Target.attachToTarget", {"targetId": tid, "flatten": True})
+                sid = attach["sessionId"]
+                # 探针注入测试：验证 Tab CDP 响应是否存活
+                self.req_id += 1
+                rid = self.req_id
+                probe_msg = {"id": rid, "method": "Runtime.evaluate", "sessionId": sid, "params": {"expression": "1+1"}}
+                await self.ws.send(json.dumps(probe_msg))
+                while True:
+                    raw = await asyncio.wait_for(self.ws.recv(), timeout=3.0)
+                    data = json.loads(raw)
+                    if data.get("id") == rid:
+                        if (data.get("result") or {}).get("result", {}).get("value") == 2:
+                            target_healthy = True
+                        break
+            except Exception as e:
+                log.warning("cdp.probe_stuck_tab id=%s err=%s — 自动关掉僵死Tab并新建", tid[:8], e)
+                try:
+                    await self.call_browser("Target.closeTarget", {"targetId": tid})
+                except Exception:
+                    pass
+
+        if target and target_healthy:
             self.target_id = target["targetId"]
             log.info("cdp.reuse_tab id=%s url=%s", self.target_id[:8], (target.get("url") or "")[:80])
+            # 复用时之前已 attach 过并存了 sid，更新该 sid
+            self.sid = sid
         else:
             create_res = await self.call_browser("Target.createTarget", {"url": "about:blank"})
             self.target_id = create_res["targetId"]
             self.created_tab = True
             log.info("cdp.new_tab id=%s", self.target_id[:8])
+            attach = await self.call_browser(
+                "Target.attachToTarget", {"targetId": self.target_id, "flatten": True}
+            )
+            self.sid = attach["sessionId"]
 
-        attach = await self.call_browser(
-            "Target.attachToTarget", {"targetId": self.target_id, "flatten": True}
-        )
-        self.sid = attach["sessionId"]
         # 资源: 只开 Page+Runtime；不开 Network（避免事件洪泛占 CPU/内存）
         await self.call_tab("Page.enable")
         await self.call_tab("Runtime.enable")
@@ -1117,6 +1158,10 @@ async def run_daemon(args) -> int:
                     "fail": consecutive_fail,
                 },
             )
+            # 连续失败梯级自愈策略 (Escalation)
+            if consecutive_fail >= 10:
+                log.critical("daemon.escalation level=3 — 连续失败10次，主动退出触发系统硬重启")
+                sys.exit(42)
         finally:
             try:
                 await client.close()
