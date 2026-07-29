@@ -131,7 +131,7 @@ def discover_cdp(ports: Optional[list[int]] = None) -> tuple[Optional[str], Opti
                     return env, ws, port
         except Exception as e:
             log.warning("cdp.env_fail url=%s err=%s — fallback scan", env, e)
-    ports = ports or [9222, 9223, 9226, 9333, 9229]
+    ports = ports or [9224, 9222, 9223, 9226, 9333, 9229]
     for p in ports:
         try:
             op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
