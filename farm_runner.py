@@ -241,6 +241,19 @@ class FarmClient:
         )
         tabs = (await self.call_browser("Target.getTargets")).get("targetInfos", [])
         pages = [t for t in tabs if t.get("type") == "page"]
+        farm_pages = [t for t in pages if "hybgzs.com" in (t.get("url") or "")]
+        
+        # 自动清理多余重复的农场 Tab / about:blank，只保留第一个健康的 Tab
+        if len(farm_pages) > 1:
+            for extra_tab in farm_pages[1:]:
+                extra_id = extra_tab.get("targetId")
+                if extra_id:
+                    try:
+                        await self.call_browser("Target.closeTarget", {"targetId": extra_id})
+                        log.info("cdp.clean_extra_tab id=%s url=%s", extra_id[:8], (extra_tab.get("url") or "")[:50])
+                    except Exception as e:
+                        log.warning("cdp.clean_extra_tab_fail id=%s err=%s", extra_id[:8], e)
+
         target = next((t for t in pages if "entertainment/farm" in (t.get("url") or "")), None)
         if not target:
             target = next((t for t in pages if "hybgzs.com" in (t.get("url") or "")), None)
