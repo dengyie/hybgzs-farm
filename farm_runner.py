@@ -212,9 +212,10 @@ def extract_list(payload: Any, *keys: str) -> list:
 
 
 class FarmClient:
-    def __init__(self, browser_ws: str, http_base: str):
+    def __init__(self, browser_ws: str, http_base: str, vip_mode: str = "none"):
         self.browser_ws = browser_ws
         self.http_base = http_base.rstrip("/")
+        self.vip_mode = vip_mode
         self.ws = None
         self.sid = None
         self.target_id = None
@@ -563,23 +564,44 @@ class FarmClient:
             s.append("无事可做（生长中）")
         return s
 
-    def score_seed(self, seed: dict, inv_qty: dict[str, int]) -> float:
+    def score_seed(self, seed: dict, inv_qty: dict[str, int], vip_mode: str = "none") -> float:
         sid = str(seed.get("id") or seed.get("seedId") or "")
+        is_vip = bool(seed.get("isVipOnly"))
+        stock = inv_qty.get(sid, 0)
+
+        # vip_mode 控制逻辑:
+        # 1. none: 严格禁用任何 VIP 作物 (哪怕有库存也不种，得分归 0)
+        # 2. inventory_only: 只有当有 VIP 库存时才允许种植，无库存得分归 0
+        # 3. full: 完全开放 VIP 作物
+        if is_vip:
+            if vip_mode == "none":
+                return -100.0
+            elif vip_mode == "inventory_only" and stock <= 0:
+                return -100.0
+
         try:
             gt = max(1, int(seed.get("growthTime") or 1))
-            hv = int(seed.get("harvestValue") or 0)
+            # 基础价格: 优先取商店收购价/单次回收全额
+            hv = float(seed.get("recyclePrice") or seed.get("harvestValue") or 0)
             hq = int(seed.get("harvestQuantity") or 1)
-            base = (hv * max(hq, 1)) / gt
+            price = float(seed.get("price") or 0)
+            
+            # 单次净收益 = 产值 - 成本
+            gross = hv * max(hq, 1)
+            net_profit = gross - price
+            # 每小时净收益 ($/hr)
+            val_per_hour = (net_profit / gt) * 3600.0 if gt > 0 else 0.0
+            base = val_per_hour
         except Exception:
             base = 0.0
-        stock = inv_qty.get(sid, 0)
+
         if stock > 0:
+            # 库存优先倾斜，避免积压仓库
             base *= 1.25
             base += stock * 0.01
-        if seed.get("isVipOnly") and stock <= 0:
-            base *= 0.05
+
         if seed.get("isEnabled") is False:
-            base = -1.0
+            base = -100.0
         return base
 
     def plan_planting(
@@ -590,6 +612,7 @@ class FarmClient:
         balance_raw: int,
         allow_buy: bool,
         prefer_seed: Optional[str] = None,
+        vip_mode: str = "none",
     ) -> list[dict]:
         if empty <= 0:
             return []
@@ -616,7 +639,7 @@ class FarmClient:
         if prefer_seed:
             candidates = [s for s in candidates if str(s.get("id")) == prefer_seed] or candidates
         candidates = [s for s in candidates if s.get("isEnabled") is not False]
-        candidates.sort(key=lambda s: self.score_seed(s, inv_qty), reverse=True)
+        candidates.sort(key=lambda s: self.score_seed(s, inv_qty, vip_mode=vip_mode), reverse=True)
 
         plan = []
         remain = empty
@@ -793,7 +816,13 @@ class FarmClient:
 
         await self.load_seeds(st)
         plan = self.plan_planting(
-            empty, st["inventory"], st["seeds"], st["balance_raw"], allow_buy=allow_buy, prefer_seed=prefer_seed
+            empty,
+            st["inventory"],
+            st["seeds"],
+            st["balance_raw"],
+            allow_buy=allow_buy,
+            prefer_seed=prefer_seed,
+            vip_mode=self.vip_mode,
         )
         if not plan:
             log.warning("action.plant no_plan allow_buy=%s", allow_buy)
@@ -1123,7 +1152,8 @@ async def run_daemon(args) -> int:
                 pass
             continue
 
-        client = FarmClient(ws, http or f"http://127.0.0.1:{port}")
+        vip_mode = getattr(args, "vip_mode", "none")
+        client = FarmClient(ws, http or f"http://127.0.0.1:{port}", vip_mode=vip_mode)
         sleep_s = care_every_s
         report = None
         try:
@@ -1220,7 +1250,8 @@ async def main_async(args) -> int:
         return 2
     log.info("cdp.found port=%s", port)
 
-    client = FarmClient(ws, http or f"http://127.0.0.1:{port}")
+    vip_mode = getattr(args, "vip_mode", "none")
+    client = FarmClient(ws, http or f"http://127.0.0.1:{port}", vip_mode=vip_mode)
     code = 0
     try:
         await client.connect()
@@ -1289,6 +1320,12 @@ async def main_async(args) -> int:
 def main():
     p = argparse.ArgumentParser(description="hybgzs 轻松农场智能自动化")
     p.add_argument("mode", nargs="?", default="status", choices=["status", "run", "care", "harvest", "plant", "daemon"])
+    p.add_argument(
+        "--vip-mode",
+        choices=["none", "inventory_only", "full"],
+        default="none",
+        help="VIP 作物策略: none=只用普通作物; inventory_only=有VIP库存才用; full=完全开放VIP (默认: none)",
+    )
     p.add_argument("--destroy-if-full", action="store_true")
     p.add_argument("--allow-buy", action="store_true")
     p.add_argument("--seed", default=None)
