@@ -528,6 +528,8 @@ class FarmClient:
     async def load_seeds(self, st: dict) -> list:
         if st.get("seeds"):
             return st["seeds"]
+        
+        # 1. 拉取基础种子列表
         res = await self.fetch_api("/api/farm/seeds")
         ok, payload, err = unwrap_api(res)
         seeds = []
@@ -538,6 +540,28 @@ class FarmClient:
                 seeds = payload
         else:
             log.warning("seeds.load_fail err=%s", err)
+
+        # 2. 并行/补充拉取官方回收价列表 (/api/farm/recycle/prices)，无缝补全 recyclePrice
+        try:
+            r_res = await self.fetch_api("/api/farm/recycle/prices")
+            r_ok, r_payload, r_err = unwrap_api(r_res)
+            if r_ok and r_payload:
+                price_list = r_payload if isinstance(r_payload, list) else (r_payload.get("data") if isinstance(r_payload, dict) else [])
+                if isinstance(price_list, list):
+                    price_by_seed = {str(item.get("seedId")): float(item.get("recyclePrice") or 0) for item in price_list if isinstance(item, dict) and item.get("seedId")}
+                    
+                    # 合并 recyclePrice 到 seeds
+                    for s in seeds:
+                        sid = str(s.get("id") or s.get("seedId") or "")
+                        if sid in price_by_seed:
+                            s["recyclePrice"] = price_by_seed[sid]
+                            # 如果没有 harvestValue，用 recyclePrice 充当
+                            if not s.get("harvestValue"):
+                                s["harvestValue"] = price_by_seed[sid]
+                    log.info("seeds.recycle_prices_merged n=%s", len(price_by_seed))
+        except Exception as e:
+            log.warning("seeds.merge_recycle_prices_fail err=%s", e)
+
         st["seeds"] = seeds or []
         log.info("seeds.loaded n=%s", len(st["seeds"]))
         return st["seeds"]
