@@ -139,6 +139,21 @@ def discover_cdp(ports: Optional[list[int]] = None) -> tuple[Optional[str], Opti
                 data = json.loads(resp.read().decode("utf-8"))
                 ws = data.get("webSocketDebuggerUrl")
                 if ws:
+                    # 校验是否为hybgzs农场专属Chrome (查找是否有hybgzs的tab)
+                    with op.open(f"http://127.0.0.1:{p}/json/list", timeout=1.2) as lresp:
+                        tabs = json.loads(lresp.read().decode("utf-8"))
+                        if any("hybgzs.com" in (t.get("url") or "") for t in tabs if isinstance(t, dict)):
+                            return f"http://127.0.0.1:{p}", ws, p
+        except Exception:
+            continue
+    # 兜底：如果没找到包含农场页面的，退而求其次返回第一个监听CDP的端口
+    for p in ports:
+        try:
+            op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with op.open(f"http://127.0.0.1:{p}/json/version", timeout=1.2) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                ws = data.get("webSocketDebuggerUrl")
+                if ws:
                     return f"http://127.0.0.1:{p}", ws, p
         except Exception:
             continue
