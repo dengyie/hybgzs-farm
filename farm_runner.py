@@ -564,14 +564,14 @@ class FarmClient:
             s.append("无事可做（生长中）")
         return s
 
-    def score_seed(self, seed: dict, inv_qty: dict[str, int], vip_mode: str = "none") -> float:
+    def score_seed(self, seed: dict, inv_qty: dict[str, int], vip_mode: str = "none", pure_profit: bool = False) -> float:
         sid = str(seed.get("id") or seed.get("seedId") or "")
         is_vip = bool(seed.get("isVipOnly"))
         stock = inv_qty.get(sid, 0)
 
         # vip_mode 控制逻辑:
-        # 1. none: 严格禁用任何 VIP 作物 (哪怕有库存也不种，得分归 0)
-        # 2. inventory_only: 只有当有 VIP 库存时才允许种植，无库存得分归 0
+        # 1. none: 严格禁用任何 VIP 作物 (哪怕有库存也不种，得分归 -100)
+        # 2. inventory_only: 只有当有 VIP 库存时才允许种植，无库存得分归 -100
         # 3. full: 完全开放 VIP 作物
         if is_vip:
             if vip_mode == "none":
@@ -582,23 +582,26 @@ class FarmClient:
         try:
             gt = max(1, int(seed.get("growthTime") or 1))
             # 基础价格: 优先取商店收购价/单次回收全额
-            hv = float(seed.get("recyclePrice") or seed.get("harvestValue") or 0)
+            raw_hv = float(seed.get("recyclePrice") or seed.get("harvestValue") or 0)
             hq = int(seed.get("harvestQuantity") or 1)
-            price = float(seed.get("price") or 0)
+            raw_price = float(seed.get("price") or 0)
+
+            # 换算为显示真实货币 ($)
+            hv = raw_hv / COIN_DIV if raw_hv > 1000 else raw_hv
+            price = raw_price / COIN_DIV if raw_price > 1000 else raw_price
             
-            # 单次净收益 = 产值 - 成本
+            # 单次净收益 = 产值 - 种子购买成本
             gross = hv * max(hq, 1)
             net_profit = gross - price
-            # 每小时净收益 ($/hr)
+            # 纯粹每小时净收益 ($/hr)
             val_per_hour = (net_profit / gt) * 3600.0 if gt > 0 else 0.0
             base = val_per_hour
         except Exception:
             base = 0.0
 
-        if stock > 0:
-            # 库存优先倾斜，避免积压仓库
-            base *= 1.25
-            base += stock * 0.01
+        if not pure_profit and stock > 0:
+            # 如果不是纯收益模式，微幅倾向使用现有库存
+            base *= 1.05
 
         if seed.get("isEnabled") is False:
             base = -100.0
@@ -639,12 +642,13 @@ class FarmClient:
         if prefer_seed:
             candidates = [s for s in candidates if str(s.get("id")) == prefer_seed] or candidates
         candidates = [s for s in candidates if s.get("isEnabled") is not False]
-        candidates.sort(key=lambda s: self.score_seed(s, inv_qty, vip_mode=vip_mode), reverse=True)
+        # 纯粹按每小时净收益 ($/hr) 进行绝对降序排列（绝对收益优先，不受库存偏好扰动）
+        candidates.sort(key=lambda s: self.score_seed(s, inv_qty, vip_mode=vip_mode, pure_profit=True), reverse=True)
 
         # 打印全量/所选策略下的作物收益排行榜日志 (Top Profit Ranking)
         log_lines = []
         for s in candidates:
-            score = self.score_seed(s, inv_qty, vip_mode=vip_mode)
+            score = self.score_seed(s, inv_qty, vip_mode=vip_mode, pure_profit=True)
             if score > -50.0:  # 过滤被禁用/限制的种子
                 sid = str(s.get("id"))
                 name = s.get("name") or sid
@@ -661,7 +665,7 @@ class FarmClient:
                 net_single = (hv * max(hq, 1)) - price
                 v_hr = (net_single / int(s.get("growthTime") or 1800)) * 3600.0 if int(s.get("growthTime") or 1800) > 0 else 0.0
                 vip_flag = "[VIP]" if s.get("isVipOnly") else "[普通]"
-                log_lines.append(f"{vip_flag}{name}({sid}): 每小时收益 ${v_hr:.2f}/hr | 单次净利 ${net_single:.2f} | 周期 {gt_min}m | 库存 {stock} | 综合得分 {score:.2f}")
+                log_lines.append(f"{vip_flag}{name}({sid}): 每小时收益 ${v_hr:.2f}/hr | 单次净利 ${net_single:.2f} | 周期 {gt_min}m | 库存 {stock} | 得分 {score:.2f}")
         
         if log_lines:
             log.info("crop.profit_ranking (策略 vip_mode=%s):\n  " + "\n  ".join(log_lines[:8]), vip_mode)
@@ -669,67 +673,61 @@ class FarmClient:
         plan = []
         remain = empty
         bal = balance_raw
-        # 1. 尝试使用现成库存
+        # 1. 如果允许购买 / 追求最高收益：优先在候选集合中选择“每小时净收益 ($/hr)”绝对最高的种子
+        # 如果该种子无库存但买得起，则直接下单购买；买不起再依次降级
+        remain = empty
+        bal = balance_raw
+        
+        # 只要能买得起更好的种子（或者有更好种子的库存），按纯收益 ($/hr) 绝对顺序消费
         for s in candidates:
             if remain <= 0:
                 break
             sid = str(s.get("id"))
-            stock = inv_qty.get(sid, 0)
-            if stock <= 0:
+            score = self.score_seed(s, inv_qty, vip_mode=vip_mode, pure_profit=True)
+            if score <= -50.0:
                 continue
-            use = min(remain, stock)
-            plan.append(
-                {
-                    "seedId": sid,
-                    "name": s.get("name") or sid,
-                    "quantity": use,
-                    "from_stock": use,
-                    "need_buy": 0,
-                    "cost": 0,
-                    "score": round(self.score_seed(s, inv_qty, vip_mode=vip_mode), 4),
-                }
-            )
-            inv_qty[sid] = stock - use
-            remain -= use
 
-        # 2. 如果还有空地，且开启了购买或库存耗尽：自动按最高收益购买种子
-        # 注意: 如果用户没显式开启 --allow-buy，但无库存时，为了防止地块空置，强制开启购买逻辑
-        if remain > 0:
-            buyable = [
-                s for s in candidates
-                if s.get("isEnabled") is not False and self.score_seed(s, inv_qty, vip_mode=vip_mode) > -50.0
-            ]
-            buyable.sort(key=lambda s: self.score_seed(s, inv_qty, vip_mode=vip_mode), reverse=True)
+            stock = inv_qty.get(sid, 0)
+            price = float(s.get("price") or 0)
 
-            for s in buyable:
-                if remain <= 0:
-                    break
-                sid = str(s.get("id"))
-                price = float(s.get("price") or 0)
+            # 场景 A: 本地有库存
+            if stock > 0:
+                use = min(remain, stock)
+                plan.append(
+                    {
+                        "seedId": sid,
+                        "name": s.get("name") or sid,
+                        "quantity": use,
+                        "from_stock": use,
+                        "need_buy": 0,
+                        "cost": 0,
+                        "score": round(score, 4),
+                    }
+                )
+                inv_qty[sid] = stock - use
+                remain -= use
+                continue
 
-                # 免费/0成本种子
-                if price <= 0:
-                    use = remain
-                    plan.append(
-                        {
-                            "seedId": sid,
-                            "name": s.get("name") or sid,
-                            "quantity": use,
-                            "from_stock": 0,
-                            "need_buy": 0,
-                            "cost": 0,
-                            "score": round(self.score_seed(s, inv_qty, vip_mode=vip_mode), 4),
-                        }
-                    )
-                    remain = 0
-                    break
+            # 场景 B: 无库存，但价格为 0 / 免费
+            if price <= 0:
+                use = remain
+                plan.append(
+                    {
+                        "seedId": sid,
+                        "name": s.get("name") or sid,
+                        "quantity": use,
+                        "from_stock": 0,
+                        "need_buy": 0,
+                        "cost": 0,
+                        "score": round(score, 4),
+                    }
+                )
+                remain = 0
+                break
 
-                can_buy = int(bal // price)
-                if can_buy <= 0:
-                    # 当前最高收益种子买不起 -> 继续下钻遍历下一个能买得起的最高收益种子
-                    log.info("plant.buy_insufficient_bal seed=%s price=%s bal=%s -> 降级寻找能买得起的收益最高种子", sid, price, coin_fmt(bal))
-                    continue
-
+            # 场景 C: 无库存，尝试花金币购买
+            can_buy = int(bal // price)
+            if can_buy > 0:
                 use = min(remain, can_buy)
                 cost = int(use * price)
                 plan.append(
@@ -740,11 +738,13 @@ class FarmClient:
                         "from_stock": 0,
                         "need_buy": use,
                         "cost": cost,
-                        "score": round(self.score_seed(s, inv_qty, vip_mode=vip_mode), 4),
+                        "score": round(score, 4),
                     }
                 )
                 bal -= cost
                 remain -= use
+            else:
+                log.info("plant.buy_insufficient_bal seed=%s price=%s bal=%s -> 降级寻找能买得起的收益最高种子", sid, price, coin_fmt(bal))
 
         # 3. 兜底策略: 如果余额连任何可买种子都买不起 -> 从背包剩余所有库存里，选择收益最高的一款种下 (无论是否为第一优先级)
         if remain > 0:
