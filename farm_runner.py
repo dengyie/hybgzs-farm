@@ -664,6 +664,7 @@ class FarmClient:
         plan = []
         remain = empty
         bal = balance_raw
+        # 1. 尝试使用现成库存
         for s in candidates:
             if remain <= 0:
                 break
@@ -680,20 +681,28 @@ class FarmClient:
                     "from_stock": use,
                     "need_buy": 0,
                     "cost": 0,
-                    "score": round(self.score_seed(s, inv_qty), 4),
+                    "score": round(self.score_seed(s, inv_qty, vip_mode=vip_mode), 4),
                 }
             )
             inv_qty[sid] = stock - use
             remain -= use
 
-        if allow_buy and remain > 0:
-            buyable = [s for s in candidates if not s.get("isVipOnly") and s.get("isEnabled") is not False]
-            buyable.sort(key=lambda s: self.score_seed(s, inv_qty), reverse=True)
+        # 2. 如果还有空地，且开启了购买或库存耗尽：自动按最高收益购买种子
+        # 注意: 如果用户没显式开启 --allow-buy，但无库存时，为了防止地块空置，强制开启购买逻辑
+        if remain > 0:
+            buyable = [
+                s for s in candidates
+                if s.get("isEnabled") is not False and self.score_seed(s, inv_qty, vip_mode=vip_mode) > -50.0
+            ]
+            buyable.sort(key=lambda s: self.score_seed(s, inv_qty, vip_mode=vip_mode), reverse=True)
+
             for s in buyable:
                 if remain <= 0:
                     break
                 sid = str(s.get("id"))
-                price = int(s.get("price") or 0)
+                price = float(s.get("price") or 0)
+
+                # 免费/0成本种子
                 if price <= 0:
                     use = remain
                     plan.append(
@@ -704,16 +713,20 @@ class FarmClient:
                             "from_stock": 0,
                             "need_buy": 0,
                             "cost": 0,
-                            "score": round(self.score_seed(s, inv_qty), 4),
+                            "score": round(self.score_seed(s, inv_qty, vip_mode=vip_mode), 4),
                         }
                     )
                     remain = 0
                     break
-                can_buy = bal // price
-                use = min(remain, can_buy)
-                if use <= 0:
+
+                can_buy = int(bal // price)
+                if can_buy <= 0:
+                    # 当前最高收益种子买不起 -> 继续下钻遍历下一个能买得起的最高收益种子
+                    log.info("plant.buy_insufficient_bal seed=%s price=%s bal=%s -> 降级寻找能买得起的收益最高种子", sid, price, coin_fmt(bal))
                     continue
-                cost = use * price
+
+                use = min(remain, can_buy)
+                cost = int(use * price)
                 plan.append(
                     {
                         "seedId": sid,
@@ -722,10 +735,38 @@ class FarmClient:
                         "from_stock": 0,
                         "need_buy": use,
                         "cost": cost,
-                        "score": round(self.score_seed(s, inv_qty), 4),
+                        "score": round(self.score_seed(s, inv_qty, vip_mode=vip_mode), 4),
                     }
                 )
                 bal -= cost
+                remain -= use
+
+        # 3. 兜底策略: 如果余额连任何可买种子都买不起 -> 从背包剩余所有库存里，选择收益最高的一款种下 (无论是否为第一优先级)
+        if remain > 0:
+            fallback_inv = [
+                s for s in candidates
+                if inv_qty.get(str(s.get("id")), 0) > 0 and self.score_seed(s, inv_qty, vip_mode=vip_mode) > -50.0
+            ]
+            fallback_inv.sort(key=lambda s: self.score_seed(s, inv_qty, vip_mode=vip_mode), reverse=True)
+            for s in fallback_inv:
+                if remain <= 0:
+                    break
+                sid = str(s.get("id"))
+                stock = inv_qty[sid]
+                use = min(remain, stock)
+                log.info("plant.fallback_inventory seed=%s qty=%s stock=%s -> 余额不足自动兜底使用背包最高收益库存", sid, use, stock)
+                plan.append(
+                    {
+                        "seedId": sid,
+                        "name": s.get("name") or sid,
+                        "quantity": use,
+                        "from_stock": use,
+                        "need_buy": 0,
+                        "cost": 0,
+                        "score": round(self.score_seed(s, inv_qty, vip_mode=vip_mode), 4),
+                    }
+                )
+                inv_qty[sid] = stock - use
                 remain -= use
 
         merged: dict[str, dict] = {}
