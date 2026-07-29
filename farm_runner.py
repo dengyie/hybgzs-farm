@@ -650,9 +650,14 @@ class FarmClient:
                 name = s.get("name") or sid
                 stock = inv_qty.get(sid, 0)
                 gt_min = round(int(s.get("growthTime") or 1800) / 60, 1)
-                hv = float(s.get("recyclePrice") or s.get("harvestValue") or 0)
+                raw_hv = float(s.get("recyclePrice") or s.get("harvestValue") or 0)
                 hq = int(s.get("harvestQuantity") or 1)
-                price = float(s.get("price") or 0)
+                raw_price = float(s.get("price") or 0)
+                
+                # 换算为真实显示货币位 ($)
+                hv = raw_hv / COIN_DIV if raw_hv > 1000 else raw_hv
+                price = raw_price / COIN_DIV if raw_price > 1000 else raw_price
+                
                 net_single = (hv * max(hq, 1)) - price
                 v_hr = (net_single / int(s.get("growthTime") or 1800)) * 3600.0 if int(s.get("growthTime") or 1800) > 0 else 0.0
                 vip_flag = "[VIP]" if s.get("isVipOnly") else "[普通]"
