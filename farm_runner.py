@@ -52,6 +52,8 @@ CDP_MAX_SIZE = 4 * 1024 * 1024
 CDP_OPEN_TIMEOUT = 8
 CDP_CALL_TIMEOUT = 15
 PAGE_READY_MAX_POLLS = 8
+FAILURE_BACKOFF_CAP = 120.0
+FAILURE_EXIT_STREAK = 5
 
 log = logging.getLogger("hybgzs.farm")
 
@@ -1141,18 +1143,23 @@ class FarmClient:
 
     async def close(self):
         # 若我们创建了临时 tab，关掉以省 Chrome 渲染资源；用户原有 farm 标签保留
-        if self.created_tab and self.target_id:
+        target_id = self.target_id
+        ws = self.ws
+        if ws and target_id and self.created_tab:
             try:
-                await self.call_browser("Target.closeTarget", {"targetId": self.target_id})
-                log.info("cdp.closed_temp_tab id=%s", self.target_id[:8])
+                await self.call_browser("Target.closeTarget", {"targetId": target_id})
+                log.info("cdp.closed_temp_tab id=%s", target_id[:8])
             except Exception as e:
                 log.warning("cdp.close_tab_fail %s", e)
-        if self.ws:
+        self.target_id = None
+        self.sid = None
+        self.created_tab = False
+        self.ws = None
+        if ws:
             try:
-                await asyncio.wait_for(self.ws.close(), timeout=3)
+                await asyncio.wait_for(ws.close(), timeout=3)
             except Exception:
                 pass
-            self.ws = None
         log.info("cdp.disconnected stats=%s", self.resource_snapshot())
 
 
@@ -1191,6 +1198,15 @@ def append_journal(path: Path, row: dict) -> None:
         f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
 
+def failure_backoff(streak: int, min_s: float, cap: float = FAILURE_BACKOFF_CAP) -> float:
+    """Keep transient farm failures responsive; mature crops must not wait 6 minutes per retry."""
+    return min(float(cap), max(float(min_s), float(min_s) * max(1, min(int(streak), 4))))
+
+
+def should_escalate(streak: int, threshold: int = FAILURE_EXIT_STREAK) -> bool:
+    return int(streak) >= int(threshold)
+
+
 async def run_daemon(args) -> int:
     """
     囤囤鼠式挂机：
@@ -1218,6 +1234,7 @@ async def run_daemon(args) -> int:
 
     cycle = 0
     consecutive_fail = 0
+    consecutive_cdp_fail = 0
     log.info(
         "daemon.start min_sleep=%s max_sleep=%s lead=%s care_every=%s journal=%s",
         min_s, max_s, lead_s, care_every_s, journal,
@@ -1233,9 +1250,19 @@ async def run_daemon(args) -> int:
         http, ws, port = discover_cdp()
         if not ws:
             consecutive_fail += 1
-            backoff = min(max_s, min_s * min(consecutive_fail, 8))
+            consecutive_cdp_fail += 1
+            backoff = failure_backoff(consecutive_cdp_fail, min_s, cap=min(FAILURE_BACKOFF_CAP, max_s))
             log.error("daemon.cdp_missing fail=%s sleep=%.0fs", consecutive_fail, backoff)
-            append_journal(journal, {"event": "cdp_missing", "cycle": cycle, "sleep": backoff})
+            append_journal(journal, {
+                "event": "cdp_missing",
+                "cycle": cycle,
+                "sleep": backoff,
+                "fail": consecutive_cdp_fail,
+                "recovery_level": 1 if consecutive_cdp_fail < FAILURE_EXIT_STREAK else 3,
+            })
+            if should_escalate(consecutive_cdp_fail):
+                log.critical("daemon.escalation level=3 — CDP连续失败%s次，主动退出触发Supervisor重启", consecutive_cdp_fail)
+                sys.exit(42)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=backoff)
             except asyncio.TimeoutError:
@@ -1248,6 +1275,7 @@ async def run_daemon(args) -> int:
         report = None
         try:
             await client.connect()
+            consecutive_cdp_fail = 0
             # 有活干或巡检：跑流水线（内部会 status）
             report = await client.run_pipeline(
                 destroy_if_full=args.destroy_if_full,
@@ -1294,7 +1322,7 @@ async def run_daemon(args) -> int:
             )
         except Exception as e:
             consecutive_fail += 1
-            sleep_s = min(max_s, min_s * min(consecutive_fail, 6))
+            sleep_s = failure_backoff(consecutive_fail, min_s, cap=min(FAILURE_BACKOFF_CAP, max_s))
             log.exception("daemon.cycle_fail cycle=%s err=%s sleep=%.0fs", cycle, e, sleep_s)
             append_journal(
                 journal,
@@ -1307,8 +1335,8 @@ async def run_daemon(args) -> int:
                 },
             )
             # 连续失败梯级自愈策略 (Escalation)
-            if consecutive_fail >= 10:
-                log.critical("daemon.escalation level=3 — 连续失败10次，主动退出触发系统硬重启")
+            if should_escalate(consecutive_fail):
+                log.critical("daemon.escalation level=3 — 连续失败%s次，主动退出触发Supervisor重启", consecutive_fail)
                 sys.exit(42)
         finally:
             try:
