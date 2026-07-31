@@ -54,6 +54,7 @@ CDP_CALL_TIMEOUT = 15
 PAGE_READY_MAX_POLLS = 8
 FAILURE_BACKOFF_CAP = 120.0
 FAILURE_EXIT_STREAK = 5
+CYCLE_TIMEOUT_S = 120.0
 
 log = logging.getLogger("hybgzs.farm")
 
@@ -116,7 +117,10 @@ class SingleInstance:
 
 def discover_cdp(ports: Optional[list[int]] = None) -> tuple[Optional[str], Optional[str], Optional[int]]:
     # FARM_CDP / COINBOT_CDP 可指定，如 http://127.0.0.1:9223
-    env = (os.environ.get("FARM_CDP") or os.environ.get("COINBOT_CDP") or "").strip().rstrip("/")
+    env = (os.environ.get("FARM_CDP") or "http://127.0.0.1:9224").strip().rstrip("/")
+    if env.rsplit(":", 1)[-1].split("/", 1)[0] != "9224":
+        log.error("cdp.reject_non_farm_endpoint url=%s", env)
+        return None, None, None
     if env.startswith("http"):
         try:
             op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -132,8 +136,9 @@ def discover_cdp(ports: Optional[list[int]] = None) -> tuple[Optional[str], Opti
                         port = None
                     return env, ws, port
         except Exception as e:
-            log.warning("cdp.env_fail url=%s err=%s — fallback scan", env, e)
-    ports = ports or [9224, 9222, 9223, 9226, 9333, 9229]
+            log.warning("cdp.env_fail url=%s err=%s — no cross-profile fallback", env, e)
+        return None, None, None
+    ports = ports or [9224]
     for p in ports:
         try:
             op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -146,17 +151,6 @@ def discover_cdp(ports: Optional[list[int]] = None) -> tuple[Optional[str], Opti
                         tabs = json.loads(lresp.read().decode("utf-8"))
                         if any("hybgzs.com" in (t.get("url") or "") for t in tabs if isinstance(t, dict)):
                             return f"http://127.0.0.1:{p}", ws, p
-        except Exception:
-            continue
-    # 兜底：如果没找到包含农场页面的，退而求其次返回第一个监听CDP的端口
-    for p in ports:
-        try:
-            op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with op.open(f"http://127.0.0.1:{p}/json/version", timeout=1.2) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                ws = data.get("webSocketDebuggerUrl")
-                if ws:
-                    return f"http://127.0.0.1:{p}", ws, p
         except Exception:
             continue
     return None, None, None
@@ -373,6 +367,7 @@ class FarmClient:
             log.info("ui.notice_closed")
 
         for i in range(PAGE_READY_MAX_POLLS):
+            text = ""
             text = str(await self.evaluate("document.body?document.body.innerText.slice(0,2000):''") or "")
             if "获取农场数据失败" in text or "重新登录" in text:
                 log.warning("ui.load_fail poll=%s — retry button", i)
@@ -390,8 +385,12 @@ class FarmClient:
                 log.debug("ui.ready poll=%s", i)
                 return True
             await asyncio.sleep(0.5)
-        log.warning("ui.ready_timeout — continue anyway")
-        return True
+        # The app may render without the expected headings. A non-empty body
+        # without an explicit auth/error banner is enough for core API validation.
+        if text.strip() and "获取农场数据失败" not in text and "重新登录" not in text:
+            log.warning("ui.ready_soft_timeout — defer readiness to core API validation")
+            return True
+        raise RuntimeError("农场页面未就绪，拒绝执行 API/写操作")
 
     async def fetch_api(self, path: str, method: str = "GET", body: Any = None) -> dict:
         self.stats["api_calls"] += 1
@@ -456,18 +455,21 @@ class FarmClient:
             max_slots = int(crops_root.get("maxSlots") or crops_root.get("baseSlots") or max_slots)
 
         ok_e, energy_payload, _ = unwrap_api(res_energy)
-        energy = {}
-        if ok_e and isinstance(energy_payload, dict):
-            energy = energy_payload.get("data") if isinstance(energy_payload.get("data"), dict) else energy_payload
+        if not ok_e or not isinstance(energy_payload, dict):
+            raise RuntimeError("energy API 失败，拒绝生成业务状态")
+        energy = energy_payload.get("data") if isinstance(energy_payload.get("data"), dict) else energy_payload
 
         ok_w, wallet_payload, _ = unwrap_api(res_wallet)
+        if not ok_w or not isinstance(wallet_payload, dict):
+            raise RuntimeError("wallet API 失败，拒绝生成业务状态")
         balance_raw = 0
-        if ok_w and isinstance(wallet_payload, dict):
-            w = wallet_payload.get("data") if isinstance(wallet_payload.get("data"), dict) else wallet_payload
-            if isinstance(w, dict):
-                balance_raw = int((w.get("wallet") or {}).get("balance") or w.get("total") or 0)
+        w = wallet_payload.get("data") if isinstance(wallet_payload.get("data"), dict) else wallet_payload
+        if isinstance(w, dict):
+            balance_raw = int((w.get("wallet") or {}).get("balance") or w.get("total") or 0)
 
         ok_i, inv_payload, _ = unwrap_api(res_inv)
+        if not ok_i or not isinstance(inv_payload, (dict, list)):
+            raise RuntimeError("inventory API 失败，拒绝生成业务状态")
         inventory = extract_list(inv_payload, "inventory", "data")
         warehouse = {}
         if isinstance(inv_payload, dict):
@@ -1277,11 +1279,14 @@ async def run_daemon(args) -> int:
             await client.connect()
             consecutive_cdp_fail = 0
             # 有活干或巡检：跑流水线（内部会 status）
-            report = await client.run_pipeline(
-                destroy_if_full=args.destroy_if_full,
-                allow_buy=args.allow_buy,
-                prefer_seed=args.seed,
-                dry_run=args.dry_run,
+            report = await asyncio.wait_for(
+                client.run_pipeline(
+                    destroy_if_full=args.destroy_if_full,
+                    allow_buy=args.allow_buy,
+                    prefer_seed=args.seed,
+                    dry_run=args.dry_run,
+                ),
+                timeout=CYCLE_TIMEOUT_S,
             )
             after = report.get("after") or {}
             # 构造最小 st 给 sleep
